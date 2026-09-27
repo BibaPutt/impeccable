@@ -1631,6 +1631,17 @@ fn human_accepted_viewport(human: Option<&Value>) -> bool {
         && c["regions"].as_array().is_some_and(|rs| rs.iter().all(|r| !matches!(r["verdict"].as_str(), Some("missing" | "contradicted"))))
 }
 
+/// When the user accepted a first viewport that the current capture no longer
+/// matches: the reason that replaces the raw score.
+fn lapsed_viewport(human: Option<&Value>, frame: &str) -> Option<String> {
+    let c = &human?["comparison"];
+    if human_accepted_viewport(human) { return None; }
+    let changed: Vec<&str> = c["regions"].as_array().into_iter().flatten()
+        .filter(|r| matches!(r["verdict"].as_str(), Some("missing" | "contradicted"))).filter_map(|r| r["id"].as_str()).collect();
+    Some(format!("the {frame} no longer matches the first viewport the user accepted ({}% against the approved screenshot{}), so that acceptance no longer covers the scores. Restore what the user accepted, or present a new first-viewport review (stage hero, component-review.md) for the changed page.",
+        pct0(c["overall"].as_f64().unwrap_or(0.)), if changed.is_empty() { String::new() } else { format!("; changed: {}", changed.join(", ")) }))
+}
+
 /// Code regions (text, control, chrome) an accepted first-viewport review
 /// covers: the current capture still renders them as the approved one did.
 fn human_accepted_regions(human: Option<&Value>, regions: &[Value]) -> std::collections::HashSet<String> {
@@ -2092,6 +2103,13 @@ fn gate_hero_inner(io: &Io, state: &mut Value, build_path: &str, min: f64, out_d
             advisories.insert(0, format!("The user accepted this first viewport in the review; {} numeric reading{} below {} advisories, not blockers.", numeric.len(), if numeric.len() == 1 { "" } else { "s" }, if numeric.len() == 1 { "is" } else { "are" }));
         }
         advisories.extend(numeric.into_iter().map(|m| format!("(advisory, first viewport accepted) {m}")));
+    } else if let Some(lapse) = lapsed_viewport(human, "hero capture") {
+        // Say why the acceptance does not hold instead of arguing the raw score.
+        match reasons.iter().position(|r| r.starts_with("hero overall")) {
+            Some(i) => { advisories.push(format!("(measured) {}", reasons[i])); reasons[i] = lapse; }
+            None if reasons.iter().any(|r| !material.contains(r)) => reasons.insert(0, lapse),
+            None => {}
+        }
     }
     if let Some(h) = human {
         report["humanHeroReview"] = json!({"proof": h["proof"], "comparison": h["comparison"], "acceptedRegions": waived, "viewportAccepted": viewport_accepted,
@@ -2330,6 +2348,9 @@ fn gate_responsive_inner(io: &Io, state: &mut Value, min: f64, out_dir: &str, na
     if viewport_accepted { report["humanTextReview"]["viewportAccepted"] = json!(true); }
     if overall < min && viewport_accepted {
         advisories.push(format!("(advisory, first viewport accepted) the desktop capture scores {}% against the comp, under {}%", pct0(overall), pct0(min)));
+    } else if let Some(lapse) = (overall < min).then(|| accepted_text.as_ref().and_then(|(comparison, _)| lapsed_viewport(Some(&json!({"comparison": comparison})), "desktop capture"))).flatten() {
+        advisories.push(format!("(measured) the desktop capture scores {}% against the comp, under {}%", pct0(overall), pct0(min)));
+        reasons.push(lapse);
     } else if overall < min {
         let bp = state.get("breakpoint").and_then(Value::as_str).map(String::from).unwrap_or_else(|| "the comp size".into());
         reasons.push(format!(

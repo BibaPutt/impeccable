@@ -1071,7 +1071,9 @@ fn accepted_first_viewport_turns_the_overall_bar_into_an_advisory() {
     assert_eq!(report["humanHeroReview"]["viewportAccepted"], true);
     // A stale approval (another rendering) closes nothing.
     let (stale, report) = run_reviewed_hero_min(&current, Some(&reviewed_hero(false, true)), REVIEWED_PAGE, 0.999);
-    assert!(!stale.ok && bar(&stale), "{:?}", stale.reasons);
+    assert!(!stale.ok && !bar(&stale), "{:?}", stale.reasons);
+    assert!(stale.reasons[0].starts_with("the hero capture no longer matches the first viewport the user accepted") && stale.reasons[0].contains("changed: headline") && stale.reasons[0].contains("new first-viewport review"), "{:?}", stale.reasons);
+    assert!(stale.advisories.iter().any(|a| a.starts_with("(measured) hero overall")), "the raw score is kept as a measurement: {:?}", stale.advisories);
     assert_eq!(report["humanHeroReview"]["viewportAccepted"], false);
     // The material veto still blocks under an accepted, below-bar viewport.
     let blank = reviewed_hero(true, false);
@@ -1105,8 +1107,14 @@ fn responsive_does_not_relitigate_an_accepted_first_viewport_score() {
     };
     let unreviewed = run(None);
     assert!(!unreviewed.ok && unreviewed.reasons.iter().any(|r| r.contains("scores")), "{:?}", unreviewed.reasons);
+    // Accepted, then shared CSS changed without changing the first viewport: the renderer
+    // still hands over the approval and the pixels still match, so the waiver holds.
     let accepted = run(Some(&current));
     assert!(accepted.ok, "{:?}", accepted.reasons);
     assert!(accepted.advisories.iter().any(|a| a.starts_with("(advisory, first viewport accepted) the desktop capture scores")), "{:?}", accepted.advisories);
-    assert!(!run(Some(&comp)).ok, "a stale approval waives nothing");
+    // A later edit that changes the first viewport: the acceptance lapses and the gate says so.
+    let lapsed = run(Some(&comp));
+    assert!(!lapsed.ok);
+    assert!(lapsed.reasons.iter().any(|r| r.starts_with("the desktop capture no longer matches the first viewport the user accepted") && r.contains("new first-viewport review")), "{:?}", lapsed.reasons);
+    assert!(!lapsed.reasons.iter().any(|r| r.contains("does not survive a common desktop width")), "{:?}", lapsed.reasons);
 }
