@@ -75,7 +75,7 @@ The agent applies the receipt: for `reclassify`, change the region's kind (and n
 The first-viewport review is unchanged in form. Two rule changes:
 
 - After three failed hero attempts, the gate's message says to present the first-viewport review instead of continuing to iterate.
-- An accepted first-viewport review for the current capture turns contradicted readings on code regions (`text`, `control`, `chrome`) into advisories, as the responsive gate already does for text. Material vetoes stay hard: a missing or unreferenced plate, an SVG illustration, a clipped plate.
+- An accepted first-viewport review for the current capture ends the numeric fight: the overall bar, the palette check and every numeric reading become advisories, in the hero gate and in the responsive and finish rechecks of the same viewport. Only material vetoes stay hard: a missing or unreferenced plate, an SVG illustration, an organic clip, a clipped plate, invented ink, and failed rendered presence. The approval binds to the capture: the approved screenshot has to match the current hero frame (overall at least 95%, nothing missing or contradicted), so a stale approval waives nothing. The binding is visual, not by source bytes: sections, motion and responsive work edit shared CSS freely, and the waiver holds while the first viewport still looks like the accepted screenshot. When it visibly changes, the gate says the first viewport differs from what the user accepted and asks for a new first-viewport review instead of quoting a raw score. A tiled ground whose repeats cannot land on the comp's positions is the case this exists for.
 
 ## Painted-pixel flag (`comp-spec`)
 

@@ -1,4 +1,7 @@
-//! A human-approved assembled capture is evidence for code-region styling, never a
+//! A human-approved assembled capture is bound by what it looks like, not by the
+//! bytes that drew it: build-phase compares it with the current capture, so later
+//! shared-CSS edits keep it while the first viewport still matches. It is evidence
+//! for the first viewport's scores, never a
 //! replacement for native integrity, missing-region, or overall fidelity gates.
 use crate::entry_capture::CdpEntryRenderer;
 use impeccable_comp_verbs::asset_capture::capture_sha256;
@@ -46,7 +49,7 @@ fn file(root: &Path, path: &str) -> Result<Vec<u8>, String> {
 fn reference(
     session: &Path,
     r: &EntryRequest,
-    evidence: &EntryEvidence,
+    _evidence: &EntryEvidence,
 ) -> Result<ApprovedReference, String> {
     let root = r.root.canonicalize().map_err(|e| e.to_string())?;
     if session
@@ -91,13 +94,14 @@ fn reference(
     let sources = state["sources"]
         .as_object()
         .ok_or("missing review sources")?;
-    for (path, hash) in sources {
-        if hash.as_str() != Some(&capture_sha256(&file(&root, path)?)) {
-            return Err(format!("reviewed source changed: {path}"));
-        }
-    }
     if !sources.contains_key(&r.artifact) || !sources.contains_key(&r.reference) {
         return Err("review must bind entry and original comp".into());
+    }
+    // Only the reference is bound by bytes: the comp the user judged against must be
+    // the comp the gates measure. Page sources may change; build-phase holds the
+    // approval to the pixels of the current first viewport instead.
+    if sources[&r.reference].as_str() != Some(&capture_sha256(&file(&root, &r.reference)?)) {
+        return Err(format!("reviewed comp changed: {}", r.reference));
     }
     let comp_url = packet["comp"]["url"]
         .as_str()
@@ -110,40 +114,6 @@ fn reference(
         )
     {
         return Err("reviewed reference differs".into());
-    }
-    // A newly added served file must not borrow an earlier approval.
-    for input in evidence.report["manifest"]["files"]
-        .as_array()
-        .ok_or("missing current native inputs")?
-    {
-        let path = input["path"].as_str().ok_or("invalid input")?;
-        let raster = matches!(
-            Path::new(path).extension().and_then(|s| s.to_str()),
-            Some("png" | "jpg" | "jpeg" | "webp" | "avif" | "gif")
-        );
-        if input["served"] == true
-            && !raster
-            && sources.get(input["path"].as_str().ok_or("invalid input")?) != Some(&input["sha256"])
-        {
-            return Err("native inputs differ from reviewed inputs".into());
-        }
-    }
-    // Available but unused raster variants are not dependencies. Every raster
-    // actually observed at the captured breakpoint must belong to the approval.
-    for frame in &evidence.frames {
-        for region in &frame.regions {
-            for binding in region.receipt["resourceBindings"]
-                .as_array()
-                .ok_or("missing observed raster bindings")?
-            {
-                if !sources
-                    .values()
-                    .any(|h| h == &binding["responseSha256"] && h.is_string())
-                {
-                    return Err("unreviewed raster contributes to current page".into());
-                }
-            }
-        }
     }
     let hash = capture["screenshotSha256"]
         .as_str()
@@ -164,7 +134,7 @@ fn reference(
     }
     Ok(ApprovedReference {
         png,
-        proof: json!({"schema":"human-assembled-reference-v1","requestId":packet["id"],"packetRevision":packet["revision"],"sha256":hash,"scope":"Code-region styling accepted in a source-bound assembled-page review; material and fidelity gates retained"}),
+        proof: json!({"schema":"human-assembled-reference-v1","requestId":packet["id"],"packetRevision":packet["revision"],"sha256":hash,"scope":"First viewport accepted in an assembled-page review; valid while the current capture matches this screenshot; material gates retained"}),
     })
 }
 impl EntryRenderer for ReviewedEntryRenderer {
@@ -255,7 +225,7 @@ impl ReviewedEntryRenderer {
 mod tests {
     use super::*;
     #[test]
-    fn approval_is_bound_to_reviewed_sources_and_the_native_capture() {
+    fn approval_is_bound_to_the_reviewed_screenshot_and_comp_not_page_bytes() {
         let dir = std::env::temp_dir().join(format!("review-reference-{}", std::process::id()));
         let root = dir.join("project");
         let session = dir.join("session");
@@ -309,9 +279,8 @@ mod tests {
             );
         }
         save(&state);
+        // Page edits keep the approval: build-phase compares pixels, not bytes.
         fs::write(root.join("index.html"), b"changed").unwrap();
-        assert!(reference(&session, &request, &evidence).is_err());
-        fs::write(root.join("index.html"), b"page").unwrap();
         let mut added = EntryEvidence {
             report: evidence.report.clone(),
             frames: vec![],
@@ -320,7 +289,11 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(json!({"path":"late.css","sha256":"new","served":true}));
-        assert!(reference(&session, &request, &added).is_err());
+        assert_eq!(reference(&session, &request, &added).unwrap().png, b"png");
+        // A different comp does not.
+        fs::write(root.join("comp.png"), b"other comp").unwrap();
+        assert!(reference(&session, &request, &evidence).is_err());
+        fs::write(root.join("comp.png"), b"comp").unwrap();
         fs::write(session.join("blobs").join(&png), b"replaced").unwrap();
         assert!(reference(&session, &request, &evidence).is_err());
         let _ = fs::remove_dir_all(dir);

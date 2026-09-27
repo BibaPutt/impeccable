@@ -1622,7 +1622,26 @@ fn clear_comparison_artifacts(out_dir: &Path) -> Result<(), String> {
     if errors.is_empty() { Ok(()) } else { Err(format!("cannot clear comparison artifacts: {}", errors.join("; "))) }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Whether the current capture is the first viewport the user accepted: the
+/// approved screenshot compared with it scores at least 95% with no region
+/// missing or contradicted. A stale approval (a different capture) fails this.
+fn human_accepted_viewport(human: Option<&Value>) -> bool {
+    let Some(c) = human.map(|h| &h["comparison"]) else { return false; };
+    c["overall"].as_f64().is_some_and(|o| o >= 0.95)
+        && c["regions"].as_array().is_some_and(|rs| rs.iter().all(|r| !matches!(r["verdict"].as_str(), Some("missing" | "contradicted"))))
+}
+
+/// When the user accepted a first viewport that the current capture no longer
+/// matches: the reason that replaces the raw score.
+fn lapsed_viewport(human: Option<&Value>, frame: &str) -> Option<String> {
+    let c = &human?["comparison"];
+    if human_accepted_viewport(human) { return None; }
+    let changed: Vec<&str> = c["regions"].as_array().into_iter().flatten()
+        .filter(|r| matches!(r["verdict"].as_str(), Some("missing" | "contradicted"))).filter_map(|r| r["id"].as_str()).collect();
+    Some(format!("the {frame} no longer matches the first viewport the user accepted ({}% against the approved screenshot{}), so that acceptance no longer covers the scores. Restore what the user accepted, or present a new first-viewport review (stage hero, component-review.md) for the changed page.",
+        pct0(c["overall"].as_f64().unwrap_or(0.)), if changed.is_empty() { String::new() } else { format!("; changed: {}", changed.join(", ")) }))
+}
+
 /// Code regions (text, control, chrome) an accepted first-viewport review
 /// covers: the current capture still renders them as the approved one did.
 fn human_accepted_regions(human: Option<&Value>, regions: &[Value]) -> std::collections::HashSet<String> {
@@ -1690,6 +1709,8 @@ fn gate_hero_inner(io: &Io, state: &mut Value, build_path: &str, min: f64, out_d
     // clips, plate readings, invented ink, the overall bar) never pass through here.
     let accepted = human_accepted_regions(human, &regions);
     let mut waived: Vec<String> = Vec::new();
+    // Material vetoes, recorded as they are raised: an accepted first viewport never waives these.
+    let mut material: Vec<String> = Vec::new();
     let mut waive = |id: &str, message: &str, advisories: &mut Vec<String>| -> bool {
         if !accepted.contains(id) { return false; }
         advisories.push(format!("(advisory, accepted in the first-viewport review) {message}"));
@@ -1713,6 +1734,7 @@ fn gate_hero_inner(io: &Io, state: &mut Value, build_path: &str, min: f64, out_d
                 "hero capture is {}x{}; the comp is {}x{}. Capture the first viewport at the comp's own dimensions (viewport {}x{}, not full page) into {build_path}.",
                 bw as i64, bh as i64, cw as i64, ch as i64, cw as i64, ch as i64
             ));
+            material.push(reasons.last().unwrap().clone());
         }
     }
     let above_bar = overall >= min;
@@ -1828,6 +1850,7 @@ fn gate_hero_inner(io: &Io, state: &mut Value, build_path: &str, min: f64, out_d
                     "region {id} is missing (detail {}%, structure {}%): the comp shows material the build does not",
                     pct0(rscore(r, "detail")), pct0(rscore(r, "structure"))
                 ));
+                material.push(reasons.last().unwrap().clone());
             }
         }
     }
@@ -1935,15 +1958,18 @@ fn gate_hero_inner(io: &Io, state: &mut Value, build_path: &str, min: f64, out_d
                 let id = o.get("id").and_then(Value::as_str).unwrap_or("");
                 let snip = o.get("snippet").and_then(Value::as_str).unwrap_or("");
                 push_region_blocker(&mut reasons, &mut region_reasons, id, format!("artifact draws an organic clip-path ({snip}) inside raster region {id}'s box; that region ships as its plate, never as a polygon"));
+                material.push(reasons.last().unwrap().clone());
             }
             let svgs = std::fs::read_to_string(abs(io, af)).map(|h| svg_illustrations(&h)).unwrap_or_default();
             for v in svgs.iter().take(6) {
                 let label = v.get("label").and_then(Value::as_str).filter(|s| !s.is_empty()).map(|l| format!(" ({l})")).unwrap_or_default();
                 let snip = v.get("snippet").and_then(Value::as_str).unwrap_or("");
                 reasons.push(format!("artifact draws an illustration in inline SVG{label}: {snip}. Drawings, diagrams, notation, and leader lines are plates or belong to the plate they annotate; only icon-sized SVG (under 64px, a few paths) is code"));
+                material.push(reasons.last().unwrap().clone());
             }
             if svgs.len() > 6 {
                 reasons.push(format!("...and {} more inline SVG illustrations", svgs.len() - 6));
+                material.push(reasons.last().unwrap().clone());
             }
         }
     }
@@ -2043,6 +2069,7 @@ fn gate_hero_inner(io: &Io, state: &mut Value, build_path: &str, min: f64, out_d
         }
         for f in &readings.plates {
             push_reading_blocker(&mut reasons, &mut region_reasons, &reading_ids, f);
+            material.push(f.clone());
         }
         let cells = readings.invented.get("cells").and_then(Value::as_array).cloned().unwrap_or_default();
         let fraction = readings.invented.get("fraction").and_then(Value::as_f64).unwrap_or(0.0);
@@ -2055,14 +2082,38 @@ fn gate_hero_inner(io: &Io, state: &mut Value, build_path: &str, min: f64, out_d
                 "the build carries ink in {} grid cells where the comp is calm ({shown}{more}); nothing exists on the page that the comp does not show (a kicker, an extra nav item, a divider, a second row of controls); remove it or name it in a stated decision after the hero passes",
                 labels.len()
             ));
+            material.push(reasons.last().unwrap().clone());
         }
     }
     // worst regions
     let worst_sorted = repair_regions(&regions, &region_reasons);
     let worst_top: Vec<&Value> = worst_sorted.iter().take(3).collect();
     let region_dir = format!("{out_dir}/regions");
+    // The user accepted this first viewport (the approved screenshot is the current
+    // capture): the numeric fight is over. Every non-material reason becomes an advisory.
+    let viewport_accepted = human_accepted_viewport(human);
+    if viewport_accepted {
+        let (kept, numeric): (Vec<String>, Vec<String>) = reasons.into_iter().partition(|r| material.contains(r));
+        reasons = kept;
+        for rows in region_reasons.values_mut() {
+            if let Some(a) = rows.as_array_mut() { a.retain(|m| m.as_str().is_some_and(|m| material.iter().any(|x| x == m))); }
+        }
+        region_reasons.retain(|_, v| v.as_array().is_some_and(|a| !a.is_empty()));
+        if !numeric.is_empty() {
+            advisories.insert(0, format!("The user accepted this first viewport in the review; {} numeric reading{} below {} advisories, not blockers.", numeric.len(), if numeric.len() == 1 { "" } else { "s" }, if numeric.len() == 1 { "is" } else { "are" }));
+        }
+        advisories.extend(numeric.into_iter().map(|m| format!("(advisory, first viewport accepted) {m}")));
+    } else if let Some(lapse) = lapsed_viewport(human, "hero capture") {
+        // Say why the acceptance does not hold instead of arguing the raw score.
+        match reasons.iter().position(|r| r.starts_with("hero overall")) {
+            Some(i) => { advisories.push(format!("(measured) {}", reasons[i])); reasons[i] = lapse; }
+            None if reasons.iter().any(|r| !material.contains(r)) => reasons.insert(0, lapse),
+            None => {}
+        }
+    }
     if let Some(h) = human {
-        report["humanHeroReview"] = json!({"proof": h["proof"], "comparison": h["comparison"], "acceptedRegions": waived, "scope": "contradicted readings on text, control and chrome regions; material vetoes retained"});
+        report["humanHeroReview"] = json!({"proof": h["proof"], "comparison": h["comparison"], "acceptedRegions": waived, "viewportAccepted": viewport_accepted,
+            "scope": if viewport_accepted { "first viewport accepted: overall bar, palette and every numeric reading are advisories; material vetoes retained" } else { "contradicted readings on text, control and chrome regions; material vetoes retained" }});
     }
     let mut g = Gate::blank();
     g.ok = reasons.is_empty();
@@ -2192,7 +2243,7 @@ fn hero_loop_verdict(state: &mut Value, gate: &Gate, artifact_path: &str, io: &I
         let lead = if last3.iter().all(|h| h.get("blockingReasons") == Some(&current)) {
             "The same hero gate checks remain unresolved after three attempts."
         } else { "The hero gate has failed three attempts in a row." };
-        return Some(format!("{lead} Stop iterating and present the first-viewport review (the assembled hero, stage hero, in component-review.md) so the user judges the page in context. An accepted review of this capture turns contradicted readings on text, control and chrome regions into advisories; a missing or unreferenced plate, an SVG illustration and a clipped plate still block. The blocking reasons below still apply."));
+        return Some(format!("{lead} Stop iterating and present the first-viewport review (the assembled hero, stage hero, in component-review.md) so the user judges the page in context. An accepted review of this capture turns the overall bar, the palette check and every numeric reading into advisories; a missing or unreferenced plate, an SVG illustration, a clipped plate and invented ink still block. The blocking reasons below still apply."));
     }
     None
 }
@@ -2290,7 +2341,17 @@ fn gate_responsive_inner(io: &Io, state: &mut Value, min: f64, out_dir: &str, na
     let mut region_reasons = Map::new();
     let overall = report.get("overall").and_then(Value::as_f64).unwrap_or(0.0);
     let mut reasons = Vec::new();
-    if overall < min {
+    // The same first viewport the user accepted, still rendered at desktop width: its
+    // score and contradictions are not re-litigated here; missing regions still block.
+    let viewport_accepted = accepted_text.as_ref().is_some_and(|(comparison, _)| human_accepted_viewport(Some(&json!({"comparison": comparison}))));
+    let mut advisories: Vec<String> = Vec::new();
+    if viewport_accepted { report["humanTextReview"]["viewportAccepted"] = json!(true); }
+    if overall < min && viewport_accepted {
+        advisories.push(format!("(advisory, first viewport accepted) the desktop capture scores {}% against the comp, under {}%", pct0(overall), pct0(min)));
+    } else if let Some(lapse) = (overall < min).then(|| accepted_text.as_ref().and_then(|(comparison, _)| lapsed_viewport(Some(&json!({"comparison": comparison})), "desktop capture"))).flatten() {
+        advisories.push(format!("(measured) the desktop capture scores {}% against the comp, under {}%", pct0(overall), pct0(min)));
+        reasons.push(lapse);
+    } else if overall < min {
         let bp = state.get("breakpoint").and_then(Value::as_str).map(String::from).unwrap_or_else(|| "the comp size".into());
         reasons.push(format!(
             "the desktop capture ({}; the top {} rows scaled to the comp's width are compared, a full-page capture is fine) scores {}% against the comp, under {}%: the first viewport does not survive a common desktop width. The hero passed at {bp}; the layout must hold from ~1280 up, not only at the comp's exact width (grid columns in fr / minmax, not fixed px that overflow and wrap).",
@@ -2305,6 +2366,10 @@ fn gate_responsive_inner(io: &Io, state: &mut Value, min: f64, out_dir: &str, na
     }
     for r in &contradicted_direction {
         let accepted = r["kind"]=="text" && accepted_text.as_ref().is_some_and(|(comparison,_)| comparison["regions"].as_array().is_some_and(|reviewed| reviewed.iter().any(|region|region["id"]==r["id"] && matches!(region["verdict"].as_str(),Some("match"|"drift")) && rscore(region,"structure")>=0.75)));
+        if viewport_accepted && !accepted {
+            advisories.push(format!("(advisory, first viewport accepted) at desktop width, region {} ({}) is contradicted (structure {}%)", r["id"].as_str().unwrap_or(""), r["kind"].as_str().unwrap_or(""), pct0(rscore(r, "structure"))));
+            continue;
+        }
         if accepted {
             report["humanTextReview"]["acceptedTextRegions"].as_array_mut().map(|v|v.push(r["id"].clone())).unwrap_or_else(||{report["humanTextReview"]["acceptedTextRegions"]=json!([r["id"].clone()]);});
             continue;
@@ -2321,6 +2386,7 @@ fn gate_responsive_inner(io: &Io, state: &mut Value, min: f64, out_dir: &str, na
     g.score = Some(overall);
     g.side_by_side = report.pointer("/files/sideBySide").and_then(Value::as_str).map(String::from);
     g.region_reasons = region_reasons;
+    g.advisories = advisories;
     publish_gate_evidence(io, out_dir, &mut report, &mut measured, &regions, &mut g, "responsive");
     g
 }
