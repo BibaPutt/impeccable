@@ -138,7 +138,7 @@ button.region:hover{opacity:1;background-color:oklch(99.5% 0 0 / .14);z-index:4}
 .sentence s{color:var(--ks-text-muted);text-decoration-color:var(--ks-text-muted);margin-right:4px}
 .flag{display:flex;align-items:baseline;gap:8px;text-align:left;font-size:var(--ks-type-ui-size);color:var(--ks-vermilion);max-width:64ch}
 .flag::before{content:"";flex-shrink:0;width:6px;height:6px;border-radius:50%;background:var(--ks-vermilion);transform:translateY(-1px)}
-.undo-line{color:var(--ks-text-muted);animation:toast-in 240ms var(--ks-ease)}.undo-line .text-action{margin-left:6px}.hint{font-size:var(--ks-type-label-size);color:var(--ks-text-faint);transition:opacity 400ms var(--ks-ease)}
+.undo-line{color:var(--ks-text-muted);animation:toast-in 240ms var(--ks-ease)}.undo-line .text-action{margin-left:6px}.undo-line .text-action .cap{margin-left:6px}.hint{font-size:var(--ks-type-label-size);color:var(--ks-text-faint);transition:opacity 400ms var(--ks-ease)}
 .hint .cap{margin:0 2px;height:18px}
 .hint.gone,.undo-line.gone{opacity:0;pointer-events:none}
 .locator{position:absolute;left:28px;bottom:14px;display:flex;flex-direction:column;align-items:flex-start;gap:6px;padding:0;border:0;background:none;color:var(--ks-text-muted)}
