@@ -138,9 +138,9 @@ button.region:hover{opacity:1;background-color:oklch(99.5% 0 0 / .14);z-index:4}
 .sentence s{color:var(--ks-text-muted);text-decoration-color:var(--ks-text-muted);margin-right:4px}
 .flag{display:flex;align-items:baseline;gap:8px;text-align:left;font-size:var(--ks-type-ui-size);color:var(--ks-vermilion);max-width:64ch}
 .flag::before{content:"";flex-shrink:0;width:6px;height:6px;border-radius:50%;background:var(--ks-vermilion);transform:translateY(-1px)}
-.hint{font-size:var(--ks-type-label-size);color:var(--ks-text-faint);transition:opacity 400ms var(--ks-ease)}
+.undo-line{color:var(--ks-text-muted);animation:toast-in 240ms var(--ks-ease)}.undo-line .text-action{margin-left:6px}.hint{font-size:var(--ks-type-label-size);color:var(--ks-text-faint);transition:opacity 400ms var(--ks-ease)}
 .hint .cap{margin:0 2px;height:18px}
-.hint.gone,.toast.gone{opacity:0;pointer-events:none}
+.hint.gone,.undo-line.gone{opacity:0;pointer-events:none}
 .locator{position:absolute;left:28px;bottom:14px;display:flex;flex-direction:column;align-items:flex-start;gap:6px;padding:0;border:0;background:none;color:var(--ks-text-muted)}
 .locator-map{position:relative;display:block;width:128px;overflow:hidden;box-shadow:0 0 0 1px var(--ks-rule);transition:box-shadow var(--ks-quick) var(--ks-ease)}
 .locator-map img{display:block;width:100%;height:100%}
@@ -167,10 +167,10 @@ button.region:hover{opacity:1;background-color:oklch(99.5% 0 0 / .14);z-index:4}
 
 /* Toast. */
 @keyframes toast-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-.toast{position:absolute;left:28px;bottom:24px;display:flex;align-items:center;gap:14px;padding:10px 12px 10px 16px;border-radius:var(--ks-radius-sm);background:var(--ks-instrument);color:var(--ks-instrument-text);font-size:var(--ks-type-ui-size);box-shadow:var(--ks-lift-2);z-index:30;animation:toast-in 200ms var(--ks-ease) both;transition:opacity 300ms var(--ks-ease)}
-.toast .text-action{color:var(--ks-instrument-text);text-decoration-color:oklch(100% 0 0 / .4)}
-.toast .text-action:hover{text-decoration-color:var(--ks-kinpaku)}
-.view-summary .toast{bottom:22px}
+
+
+
+.view-summary 
 
 /* Summary. */
 .summary{width:100%;max-width:1240px;margin:0 auto;padding:36px 48px 0;display:flex;flex-direction:column;gap:36px}
@@ -231,7 +231,7 @@ button.region:hover{opacity:1;background-color:oklch(99.5% 0 0 / .14);z-index:4}
  .decisions{flex-wrap:wrap;width:100%}
  .decisions .ks-button{flex:1 1 40%;min-width:0}
  .cap{display:none}
- .toast{position:fixed;left:16px;bottom:128px;width:max-content;max-width:calc(100% - 32px)}
+ 
  .summary{padding:24px 16px 0}
  .send-inner{padding:12px 16px;flex-wrap:wrap}
  .send-row p{text-align:left}

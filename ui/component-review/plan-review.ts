@@ -72,6 +72,8 @@ export function mountPlanReview(host: HTMLElement, packet: PlanPacket, options: 
   let justSent = false;
   let error = '';
   let toast: { label: string; before: PlanDraft; view: View; current?: string; timer: number } | null = null;
+  /** The last decision and its undo, shown in the caption slot above the decision bar (or the send row on the summary), never floating over the controls. */
+  const undoLine = () => toast ? `<p class="hint undo-line" role="status">${esc(toast.label)} <button type="button" class="text-action" id="undo">Undo${kbd('⌘Z')}</button></p>` : '';
   let hintSeen = storage.get('impeccable.review.flipHint') === '1';
   let resize: ResizeObserver | null = null;
   let strips: (() => void) | null = null;
@@ -145,7 +147,7 @@ export function mountPlanReview(host: HTMLElement, packet: PlanPacket, options: 
   }
   function showToast(label: string, before: PlanDraft) {
     if (toast) clearTimeout(toast.timer);
-    toast = { label, before, view, current, timer: window.setTimeout(() => { toast = null; root.querySelector('.toast')?.classList.add('gone'); }, 6000) };
+    toast = { label, before, view, current, timer: window.setTimeout(() => { toast = null; root.querySelector('.undo-line')?.classList.add('gone'); }, 6000) };
   }
   function commit(next: PlanDraft, label: string) {
     const before = draft;
@@ -345,7 +347,7 @@ export function mountPlanReview(host: HTMLElement, packet: PlanPacket, options: 
       <div class="stage-foot">
         ${sentence}
         ${flags.map(f => `<p class="flag">${esc(f)}</p>`).join('')}
-        ${c.role === 'asset' && !hintSeen && !submitted ? `<p class="hint">Hold ${kbd('Space')} to flip to the comp. Hover to magnify both.</p>` : ''}
+        ${toast ? undoLine() : c.role === 'asset' && !hintSeen && !submitted ? `<p class="hint">Hold ${kbd('Space')} to flip to the comp. Hover to magnify both.</p>` : ''}
       </div>
       <button type="button" class="locator" id="open-map" aria-label="Open the comp"><span class="locator-map" style="aspect-ratio:${packet.comp.width}/${packet.comp.height}"><img src="${url(packet.comp.url)}" alt="" draggable="false"><span class="locator-box" style="${boxStyle(c.box)}"></span></span><span class="locator-label">Comp ${kbd('C')}</span></button>
     </div>
@@ -412,7 +414,7 @@ export function mountPlanReview(host: HTMLElement, packet: PlanPacket, options: 
         </div>
       </section>
     </div>
-    ${submitted ? '' : `<div class="send-row"><div class="send-inner"><p>${esc(helper)}</p><button type="button" class="ks-button ks-button-primary" id="send" ${!s.canSubmit || !!form || sending || !!options.status ? 'disabled' : ''}>${sending ? 'Sending…' : esc(sendLabel(packet, draft))}${sending ? '' : ksArrow}</button></div></div>`}`;
+    ${submitted ? '' : `<div class="send-row"><div class="send-inner">${toast ? undoLine() : `<p>${esc(helper)}</p>`}<button type="button" class="ks-button ks-button-primary" id="send" ${!s.canSubmit || !!form || sending || !!options.status ? 'disabled' : ''}>${sending ? 'Sending…' : esc(sendLabel(packet, draft))}${sending ? '' : ksArrow}</button></div></div>`}`;
   }
 
   function mapOverlay() {
@@ -429,7 +431,6 @@ export function mountPlanReview(host: HTMLElement, packet: PlanPacket, options: 
     root.innerHTML = `<style>${planStyles}</style><section class="rv view-${view} ${submitted ? 'is-submitted' : ''}" aria-label="Plan and asset review">
       ${topBar()}${banner()}
       <main class="screen">${view === 'intro' ? intro() : view === 'stage' ? stage() : summary()}</main>
-      ${toast ? `<div class="toast" role="status"><span>${esc(toast.label)}</span><button type="button" class="text-action" id="undo">Undo${kbd('⌘Z')}</button></div>` : ''}
       ${mapOverlay()}
     </section>`;
     enter = null;
