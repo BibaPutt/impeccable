@@ -969,6 +969,10 @@ fn reviewed_hero(restyled: bool, plate_shown: bool) -> Image {
 }
 
 fn run_reviewed_hero(capture: &Image, approved: Option<&Image>, html: &str) -> (Gate, Value) {
+    run_reviewed_hero_min(capture, approved, html, HERO_MIN)
+}
+
+fn run_reviewed_hero_min(capture: &Image, approved: Option<&Image>, html: &str, min: f64) -> (Gate, Value) {
     let ws = Workspace::new();
     let comp = reviewed_hero(false, true);
     let png = |i: &Image| png_io::encode_png(i, &[]).unwrap();
@@ -984,7 +988,7 @@ fn run_reviewed_hero(capture: &Image, approved: Option<&Image>, html: &str) -> (
     let receipt = json!({"status":"ok","score":0.9,"file":"art.png","assetHash":sha256_file(&io,"art.png"),"compHash":sha256_file(&io,"comp.png"),"regionHash":sha256_bytes(util::json_pretty(&art).as_bytes()),"referenceHash":plate_reference_hash(&spec)});
     let mut state = json!({"comp":"comp.png","capturePolicy":"native-html-v1","plates":{"art":receipt},"phases":{"hero":{}}});
     let renderer = ReviewedRenderer { hero: png(capture), approved: approved.map(png) };
-    let gate = gate_hero(&io, &mut state, "unused.png", HERO_MIN, "diff", Some("index.html"), &no_organic_scan, Some(&renderer));
+    let gate = gate_hero(&io, &mut state, "unused.png", min, "diff", Some("index.html"), &no_organic_scan, Some(&renderer));
     let report = serde_json::from_slice(&std::fs::read(ws.path.join("diff/report.json")).unwrap()).unwrap();
     (gate, report)
 }
@@ -1051,4 +1055,58 @@ fn third_failed_hero_attempt_sends_the_agent_to_the_first_viewport_review() {
     passed.ok = true;
     passed.score = Some(0.9);
     assert!(hero_loop_verdict(&mut state, &passed, "index.html", &io).is_none());
+}
+
+#[test]
+fn accepted_first_viewport_turns_the_overall_bar_into_an_advisory() {
+    // A tiled ground can never land on the comp's repeats: the bar fails on a correct page.
+    let current = reviewed_hero(true, true);
+    let bar = |g: &Gate| g.reasons.iter().any(|r| r.starts_with("hero overall"));
+    let (unreviewed, _) = run_reviewed_hero_min(&current, None, REVIEWED_PAGE, 0.999);
+    assert!(bar(&unreviewed), "{:?}", unreviewed.reasons);
+    let (accepted, report) = run_reviewed_hero_min(&current, Some(&current), REVIEWED_PAGE, 0.999);
+    assert!(accepted.ok, "{:?}", accepted.reasons);
+    assert!(accepted.advisories[0].starts_with("The user accepted this first viewport in the review"), "{:?}", accepted.advisories);
+    assert!(accepted.advisories.iter().any(|a| a.starts_with("(advisory, first viewport accepted) hero overall")), "{:?}", accepted.advisories);
+    assert_eq!(report["humanHeroReview"]["viewportAccepted"], true);
+    // A stale approval (another rendering) closes nothing.
+    let (stale, report) = run_reviewed_hero_min(&current, Some(&reviewed_hero(false, true)), REVIEWED_PAGE, 0.999);
+    assert!(!stale.ok && bar(&stale), "{:?}", stale.reasons);
+    assert_eq!(report["humanHeroReview"]["viewportAccepted"], false);
+    // The material veto still blocks under an accepted, below-bar viewport.
+    let blank = reviewed_hero(true, false);
+    let (missing, _) = run_reviewed_hero_min(&blank, Some(&blank), REVIEWED_PAGE, 0.999);
+    assert!(!missing.ok);
+    assert_eq!(missing.reasons.iter().filter(|r| !r.contains("region art is missing")).count(), 0, "only the material veto blocks: {:?}", missing.reasons);
+}
+
+struct DesktopRenderer { desktop: Vec<u8>, approved: Option<Vec<u8>> }
+impl EntryRenderer for DesktopRenderer {
+    fn capture_entry(&self, _: &EntryRequest) -> Result<Box<dyn CapturedEntry>, String> {
+        let frame = |name: &str| crate::entry_capture::FrameEvidence { name: name.into(), png: self.desktop.clone(), regions: vec![] };
+        Ok(Box::new(ReviewedCapture(crate::entry_capture::EntryEvidence { report: json!({}), frames: vec![frame("desktop"), frame("mobile")] },
+            self.approved.clone().map(|png| crate::entry_capture::ApprovedReference { png, proof: json!({"schema": "test-review"}) }))))
+    }
+}
+
+#[test]
+fn responsive_does_not_relitigate_an_accepted_first_viewport_score() {
+    let ws = Workspace::new();
+    let comp = reviewed_hero(false, false);
+    let png = |i: &Image| png_io::encode_png(i, &[]).unwrap();
+    ws.write("comp.png", &png(&comp));
+    ws.write("index.html", b"<main><h1>Headline</h1></main>");
+    ws.write(SPEC_PATH, util::json_pretty(&json!({"comp":"comp.png","regions":[{"id":"headline","kind":"control","medium":"semantic","note":"striped headline lettering",
+        "box":{"x":0.6,"y":0.7,"w":0.3,"h":0.2},"px":{"x":120,"y":84,"w":60,"h":24}}]})).as_bytes());
+    let current = reviewed_hero(true, false);
+    let run = |approved: Option<&Image>| {
+        let mut state = json!({"comp":"comp.png","capturePolicy":"native-html-v1","phases":{}});
+        gate_responsive(&ws.io(), &mut state, 0.999, "diff", Some(&DesktopRenderer { desktop: png(&current), approved: approved.map(png) }))
+    };
+    let unreviewed = run(None);
+    assert!(!unreviewed.ok && unreviewed.reasons.iter().any(|r| r.contains("scores")), "{:?}", unreviewed.reasons);
+    let accepted = run(Some(&current));
+    assert!(accepted.ok, "{:?}", accepted.reasons);
+    assert!(accepted.advisories.iter().any(|a| a.starts_with("(advisory, first viewport accepted) the desktop capture scores")), "{:?}", accepted.advisories);
+    assert!(!run(Some(&comp)).ok, "a stale approval waives nothing");
 }
