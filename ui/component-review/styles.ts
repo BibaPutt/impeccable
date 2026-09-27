@@ -179,6 +179,7 @@ input[type=checkbox]{accent-color:var(--ks-ink)}
 .text-action:hover{text-decoration-color:var(--ks-link-on-paper-line-hover)}
 .compare-toolbar{align-items:center;gap:16px}
 .comparison-actions{display:flex;gap:8px;margin-left:auto}
+.ks-icon-button{padding:0;min-height:0}
 .ks-icon-button .utility-icon{width:16px;height:16px}
 .mobile-panes{padding:8px 14px}
 .ks-checkbox input{margin:0}
