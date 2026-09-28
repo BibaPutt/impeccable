@@ -49,13 +49,40 @@ fn png_size(bytes: &[u8]) -> Option<(u64, u64)> {
          u64::from(u32::from_be_bytes(bytes[20..24].try_into().unwrap())))
     })
 }
-fn project_path(project: &Path, value: &str) -> String {
-    Path::new(value).strip_prefix(project).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| value.to_string())
+/// A spec path as a project-relative, `/`-separated path. Comp-spec may record an
+/// absolute path (inside the project) or a Windows one; the project is matched as
+/// the caller spelled it and canonicalized (`\\?\` on Windows, `/private/tmp` on macOS).
+fn project_path(roots: &[&Path], value: &str) -> String {
+    fn slashes(p: &str) -> String {
+        let p = p.replace('\\', "/");
+        p.strip_prefix("//?/").map(String::from).unwrap_or(p)
+    }
+    let v = slashes(value);
+    let within = |root: &Path, v: &str| {
+        let root = slashes(&root.to_string_lossy());
+        let root = root.trim_end_matches('/');
+        (!root.is_empty()).then(|| v.strip_prefix(root)).flatten()
+            .and_then(|rest| rest.strip_prefix('/')).map(String::from)
+    };
+    if let Some(rest) = roots.iter().find_map(|root| within(root, &v)) {
+        return rest;
+    }
+    // An absolute path reached through a symlinked prefix of the project.
+    if Path::new(value).is_absolute() {
+        if let Ok(full) = Path::new(value).canonicalize() {
+            let full = slashes(&full.to_string_lossy());
+            if let Some(rest) = roots.iter().filter_map(|r| r.canonicalize().ok()).find_map(|root| within(&root, &full)) {
+                return rest;
+            }
+        }
+    }
+    v
 }
 
 /// Build the v3 manifest from the current spec, comp and plate files.
-pub fn build(project: &Path) -> Result<Value, String> {
-    let project = project.canonicalize().map_err(|e| e.to_string())?;
+pub fn build(cwd: &Path) -> Result<Value, String> {
+    let project = cwd.canonicalize().map_err(|e| e.to_string())?;
+    let roots = [cwd, project.as_path()];
     let bytes = std::fs::read(project.join(SPEC))
         .map_err(|_| format!("no measured spec at {SPEC}; run comp-spec --comp <png> --regions <json> first"))?;
     let spec: Value = serde_json::from_slice(&bytes).map_err(|e| format!("{SPEC}: {e}"))?;
@@ -63,7 +90,7 @@ pub fn build(project: &Path) -> Result<Value, String> {
     let state = super::store::read(&project.join(".impeccable/build/state.json")).unwrap_or(Value::Null);
     let comp = spec["comp"].as_str().or_else(|| state["comp"].as_str()).filter(|s| !s.is_empty())
         .ok_or("the spec names no comp; rerun comp-spec --comp <png> --regions <json>")?;
-    let comp = project_path(&project, comp);
+    let comp = project_path(&roots, comp);
     relative(&comp)?;
     let (width, height) = match (spec["compSize"]["width"].as_u64(), spec["compSize"]["height"].as_u64()) {
         (Some(w), Some(h)) => (w, h),
@@ -81,7 +108,7 @@ pub fn build(project: &Path) -> Result<Value, String> {
         }
         let note = r["note"].as_str().unwrap_or("");
         if raster(kind) {
-            let plate = r["plate"].as_str().map(|p| project_path(&project, p))
+            let plate = r["plate"].as_str().map(|p| project_path(&roots, p))
                 .unwrap_or_else(|| format!("assets/plates/{id}.png"));
             if relative(&plate).is_err() || !project.join(&plate).is_file() {
                 missing.push(format!("  - {id} ({kind}): {plate}"));
@@ -142,6 +169,18 @@ pub fn gate(store: &Path, project: &Path, s: &str) -> Result<(), String> {
     decide(&super::lifecycle::project_sessions(store, &project)?, &project, s, &steps)
 }
 
+/// Whether the user accepted an assembled first viewport for this build journey,
+/// locally (`store`) or in the host's named `sessions`. Once one is accepted, the
+/// review store hands back that session, so no new first-viewport review can open.
+pub fn first_viewport_accepted(store: Option<&Path>, sessions: &[std::path::PathBuf], project: &Path) -> bool {
+    let Ok(project) = project.canonicalize() else { return false };
+    if let Some(store) = store {
+        if matches!(super::lifecycle::final_session(store, &project), Ok(Some(_))) { return true; }
+    }
+    sessions.iter().any(|dir| super::store::read(&dir.join("current.json"))
+        .is_ok_and(|state| state["packet"]["stage"] == "hero" && super::lifecycle::accepted_in(dir, &state)))
+}
+
 /// A hosted review lives in the host's store and its captures use snapshots, so the
 /// host names its trusted session directories (as `lifecycle --hosted --session-dir`
 /// does) and the same acceptance, integrity and spec-digest rules apply to them.
@@ -166,18 +205,49 @@ fn decide(sessions: &[std::path::PathBuf], project: &Path, s: &str, steps: &str)
     let sha = digest(&bytes);
     let steps = format!("{steps} Write no page code before it is accepted.");
     let mut plans = Vec::new();
+    let mut stale = None;
     for dir in sessions {
         let state = super::store::read(&dir.join("current.json"))?;
         if state["packet"]["schemaVersion"] == 3 && state["packet"]["stage"] == "components" {
             if super::lifecycle::accepted_in(dir, &state) && state["packet"]["specSha256"] == sha.as_str() {
-                return Ok(());
+                // The user judged these plate bytes; a plate replaced since is unreviewed.
+                match super::store::sources_current(&state) {
+                    Ok(()) => return Ok(()),
+                    Err(why) => stale = Some(why),
+                }
             }
             plans.push(state);
         }
     }
+    if let Some(why) = stale {
+        let why = why.strip_prefix("review is stale: ").unwrap_or(&why).trim_end_matches("; prepare a new round");
+        return Err(format!("A reviewed plate changed after the user accepted the plan and asset review ({why}). Present a new round; unchanged decisions carry over. {steps}"));
+    }
     Err(match plans.iter().find(|s| super::lifecycle::accepted(s)) {
         Some(_) => format!("The plan and asset review was accepted for an earlier spec.json; the spec changed since. {steps} Unchanged decisions carry over."),
-        None if plans.iter().any(|s| s["receipt"]["visualDecision"] == "changes-requested") => format!("The user requested changes in the plan and asset review. Read the receipt with {s} component-review status --session <session>, apply it (reclassify regions in the regions file and rerun comp-spec --regions; regenerate revised plates), then present a new round. {steps}"),
+        None if plans.iter().any(|s| s["receipt"]["visualDecision"] == "changes-requested") => format!("The user requested changes in the plan and asset review. Read the receipt with {s} component-review status --session <session>, apply it (reclassify regions in the regions file and rerun {s} comp-spec --comp <comp.png> --regions <regions.json>; regenerate revised plates), then present a new round. {steps}"),
         None => format!("The plan and asset review is not accepted for this build. {steps}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::project_path;
+    use std::path::Path;
+
+    #[test]
+    fn spec_paths_become_project_relative_with_forward_slashes() {
+        let raw = Path::new("/tmp/site");
+        let canonical = Path::new("/private/tmp/site");
+        let roots = [raw, canonical];
+        assert_eq!(project_path(&roots, "comp.png"), "comp.png");
+        assert_eq!(project_path(&roots, r"assets\plates\art.png"), "assets/plates/art.png");
+        assert_eq!(project_path(&roots, "/tmp/site/comp.png"), "comp.png");
+        assert_eq!(project_path(&roots, "/private/tmp/site/assets/art.png"), "assets/art.png");
+        // A sibling that shares the prefix is not inside the project.
+        assert_eq!(project_path(&roots, "/tmp/site-2/comp.png"), "/tmp/site-2/comp.png");
+        let windows = [Path::new(r"C:\work\site"), Path::new(r"\\?\C:\work\site")];
+        assert_eq!(project_path(&windows, r"C:\work\site\assets\art.png"), "assets/art.png");
+        assert_eq!(project_path(&windows, r"\\?\C:\work\site\comp.png"), "comp.png");
+    }
 }

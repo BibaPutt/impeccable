@@ -104,6 +104,21 @@ const cases = [
     },
     args: ['plan'], files: ['.impeccable/review/components.json'], env: env(),
   },
+  // Absolute paths inside the project and backslashed ones come back project-relative
+  // with forward slashes (comp-spec may record either).
+  {
+    id: 'component-review-plan-absolute-paths', verb: 'component-review', workspace: WS,
+    setup: (ws) => {
+      const spec = JSON.parse(fs.readFileSync(path.join(ws, 'spec.json'), 'utf8'));
+      spec.comp = path.join(fs.realpathSync(ws), 'comp.png');
+      for (const r of spec.regions) if (r.id === 'art') r.plate = 'assets\\plates\\art.png';
+      write(ws, '.impeccable/build/spec.json', JSON.stringify(spec));
+      write(ws, 'assets/plates/art.png', fs.readFileSync(path.join(ws, 'comp.png')));
+    },
+    args: ['plan'], files: ['.impeccable/review/components.json'], env: env(),
+    // The spec names the staged workspace, so its digest is run-dependent.
+    normalize: [['("specSha256": ")[0-9a-f]{64}', 'g', '$1<SHA256>']],
+  },
 ];
 
 export default cases;

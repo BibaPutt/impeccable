@@ -1261,3 +1261,39 @@ fn plan_puts_flagged_assets_first_with_their_flags() {
     assert_eq!(packet["components"][0]["role"], "asset");
     assert!(packet["components"][3]["flags"].is_null());
 }
+
+#[test]
+fn a_plate_replaced_after_acceptance_reopens_the_plan_review() {
+    let f = Fixture::new();
+    f.plan_project();
+    f.plates();
+    let dir = f.plan_round();
+    let state = store::read(&dir.join("current.json")).unwrap();
+    store::submit(&dir, &approve(&state)).unwrap();
+    f.gate().unwrap();
+    fs::write(f.project.join("assets/art.png"), b"a different art plate").unwrap();
+    let err = f.gate().unwrap_err();
+    assert!(err.contains("A reviewed plate changed") && err.contains("assets/art.png changed") && err.contains("Present a new round; unchanged decisions carry over"), "{err}");
+    // A new round over the new plate is reviewable, and its acceptance opens the gate again.
+    let dir = f.plan_round();
+    let state = store::read(&dir.join("current.json")).unwrap();
+    store::submit(&dir, &approve(&state)).unwrap();
+    f.gate().unwrap();
+}
+
+#[test]
+fn plan_accepts_absolute_and_backslashed_spec_paths_inside_the_project() {
+    let f = Fixture::new();
+    f.plan_project();
+    f.plates();
+    let mut spec: Value = serde_json::from_str(PLAN_SPEC).unwrap();
+    spec["comp"] = json!(f.project.join("comp.png").to_string_lossy());
+    spec["regions"][1]["plate"] = json!(f.project.canonicalize().unwrap().join("assets/art.png").to_string_lossy());
+    spec["regions"][2]["plate"] = json!(r"assets\photo.png");
+    fs::write(f.project.join(".impeccable/build/spec.json"), spec.to_string()).unwrap();
+    let packet = super::plan::build(&f.project).unwrap();
+    assert_eq!(packet["comp"]["path"], "comp.png");
+    let preview = |id: &str| packet["components"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap()["preview"]["path"].clone();
+    assert_eq!(preview("art"), "assets/art.png");
+    assert_eq!(preview("photo"), "assets/photo.png");
+}
