@@ -46,11 +46,7 @@ fn file(root: &Path, path: &str) -> Result<Vec<u8>, String> {
 }
 /// Read only private native session state. The host selects the session; neither
 /// a model-written receipt nor a saved build-phase report is an authority.
-fn reference(
-    session: &Path,
-    r: &EntryRequest,
-    _evidence: &EntryEvidence,
-) -> Result<ApprovedReference, String> {
+fn reference(session: &Path, r: &EntryRequest) -> Result<ApprovedReference, String> {
     let root = r.root.canonicalize().map_err(|e| e.to_string())?;
     if session
         .canonicalize()
@@ -143,7 +139,7 @@ impl EntryRenderer for ReviewedEntryRenderer {
         let candidate = self
             .session
             .as_ref()
-            .map(|s| reference(s, r, source.evidence()));
+            .map(|s| reference(s, r));
         let mut report = source.evidence().report.clone();
         if let Some(Err(reason)) = &candidate {
             report["humanTextReview"] = json!({"status":"not-current","reason":reason});
@@ -195,11 +191,7 @@ impl CapturedEntry for ReviewedEntry {
     fn verify_current(&self) -> Result<(), String> {
         self.source.verify_current()?;
         if let Some(a) = &self.approved {
-            let current = reference(
-                self.session.as_ref().unwrap(),
-                &self.request,
-                self.source.evidence(),
-            )?;
+            let current = reference(self.session.as_ref().unwrap(), &self.request)?;
             if current.png != a.png || current.proof != a.proof {
                 return Err("human review changed during capture".into());
             }
@@ -251,12 +243,8 @@ mod tests {
             reference: "comp.png".into(),
             stage: impeccable_comp_verbs::entry_capture::EntryStage::Responsive,
         };
-        let evidence = EntryEvidence {
-            report: json!({"manifest":{"files":[{"path":"index.html","sha256":page,"served":true}]}}),
-            frames: vec![],
-        };
         assert_eq!(
-            reference(&session, &request, &evidence).unwrap().png,
+            reference(&session, &request).unwrap().png,
             b"png"
         );
         for (pointer, value) in [
@@ -274,28 +262,21 @@ mod tests {
             *broken.pointer_mut(pointer).unwrap() = value;
             save(&broken);
             assert!(
-                reference(&session, &request, &evidence).is_err(),
+                reference(&session, &request).is_err(),
                 "{pointer}"
             );
         }
         save(&state);
         // Page edits keep the approval: build-phase compares pixels, not bytes.
         fs::write(root.join("index.html"), b"changed").unwrap();
-        let mut added = EntryEvidence {
-            report: evidence.report.clone(),
-            frames: vec![],
-        };
-        added.report["manifest"]["files"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"path":"late.css","sha256":"new","served":true}));
-        assert_eq!(reference(&session, &request, &added).unwrap().png, b"png");
+        fs::write(root.join("late.css"), b"new").unwrap();
+        assert_eq!(reference(&session, &request).unwrap().png, b"png");
         // A different comp does not.
         fs::write(root.join("comp.png"), b"other comp").unwrap();
-        assert!(reference(&session, &request, &evidence).is_err());
+        assert!(reference(&session, &request).is_err());
         fs::write(root.join("comp.png"), b"comp").unwrap();
         fs::write(session.join("blobs").join(&png), b"replaced").unwrap();
-        assert!(reference(&session, &request, &evidence).is_err());
+        assert!(reference(&session, &request).is_err());
         let _ = fs::remove_dir_all(dir);
     }
 }
