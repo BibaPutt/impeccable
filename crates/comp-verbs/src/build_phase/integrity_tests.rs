@@ -111,7 +111,7 @@ fn stall_feedback_does_not_rebuild_a_nonblocking_plate() {
     gate.score = Some(0.7524);
     gate.worst_ids = vec!["accepted-fox".into()];
     for _ in 0..3 {
-        if let Some(message) = hero_loop_verdict(&mut state, &gate, "missing.html", &io) {
+        if let Some(message) = hero_loop_verdict(&mut state, &gate, "missing.html", &io, false) {
             assert!(!message.contains("accepted-fox"), "{message}");
             assert!(!message.contains("generate-image"), "{message}");
         }
@@ -917,6 +917,15 @@ fn page_work_waits_for_the_plan_and_asset_review_of_the_current_spec() {
     assert_eq!(run(&["record", "hero"].map(String::from), &mut io, &no_organic_scan), 1);
     let err = String::from_utf8(captured.stderr.borrow().clone()).unwrap();
     assert!(err.contains("record hero refused") && err.contains("component-review capture --manifest .impeccable/review/components.json"), "{err}");
+    // advance from hero applies the same check, so a spec change after the plates closed cannot slip past it.
+    let mut state = json!({"phase":"hero","comp":"comp.png","phases":{"plates":{"status":"closed"},"hero":{"attempts":0}}});
+    let result = advance(&io, &mut state, false, None, &opts, &no_organic_scan, None);
+    assert!(!result.ok && result.reasons.iter().any(|r| r.contains("plan and asset review")), "{:?}", result.reasons);
+    // A plates advance forced with a quoted downgrade waived the review; the hero phase honours that.
+    let mut forced = json!({"phase":"hero","comp":"comp.png","phases":{"plates":{"status":"closed","forced":{"reason":"quoted"}},"hero":{"attempts":0}}});
+    assert!(hero_plan_review_refusal(&io, &forced).is_none());
+    let result = advance(&io, &mut forced, false, None, &opts, &no_organic_scan, None);
+    assert!(!result.reasons.iter().any(|r| r.contains("plan and asset review")), "{:?}", result.reasons);
     // A hosted session fails closed: no named sessions, or sessions without an accepted review.
     let (hosted, _) = io_with(&[("IMPECCABLE_COMPONENT_REVIEW_TOOL", "component_review")]);
     let why = plan_review_refusal(&hosted).unwrap();
@@ -1045,16 +1054,30 @@ fn third_failed_hero_attempt_sends_the_agent_to_the_first_viewport_review() {
     let mut state = json!({"phases":{"hero":{}}});
     let mut gate = Gate::fail(vec!["hero overall 61% < 80%".into()]);
     gate.score = Some(0.61);
-    assert!(hero_loop_verdict(&mut state, &gate, "index.html", &io).is_none());
+    assert!(hero_loop_verdict(&mut state, &gate, "index.html", &io, false).is_none());
     gate.reasons = vec!["region headline (text) is contradicted".into()];
-    assert!(hero_loop_verdict(&mut state, &gate, "index.html", &io).is_none());
-    let third = hero_loop_verdict(&mut state, &gate, "index.html", &io).unwrap();
+    assert!(hero_loop_verdict(&mut state, &gate, "index.html", &io, false).is_none());
+    let third = hero_loop_verdict(&mut state, &gate, "index.html", &io, false).unwrap();
     assert!(third.starts_with("The hero gate has failed three attempts in a row. Stop iterating and present the first-viewport review"), "{third}");
-    assert!(hero_loop_verdict(&mut state, &gate, "index.html", &io).unwrap().starts_with("The same hero gate checks remain unresolved"));
+    assert!(hero_loop_verdict(&mut state, &gate, "index.html", &io, false).unwrap().starts_with("The same hero gate checks remain unresolved"));
     let mut passed = Gate::fail(vec![]);
     passed.ok = true;
     passed.score = Some(0.9);
-    assert!(hero_loop_verdict(&mut state, &passed, "index.html", &io).is_none());
+    assert!(hero_loop_verdict(&mut state, &passed, "index.html", &io, false).is_none());
+}
+
+#[test]
+fn third_failed_hero_attempt_after_acceptance_asks_to_restore_not_to_review_again() {
+    // The review store hands back the accepted session, so asking for a new review would loop.
+    let ws = Workspace::new();
+    let io = ws.io();
+    let mut state = json!({"phases":{"hero":{}}});
+    let mut gate = Gate::fail(vec!["the hero capture no longer matches the first viewport the user accepted".into()]);
+    gate.score = Some(0.61);
+    for _ in 0..2 { assert!(hero_loop_verdict(&mut state, &gate, "index.html", &io, true).is_none()); }
+    let third = hero_loop_verdict(&mut state, &gate, "index.html", &io, true).unwrap();
+    assert!(third.contains("already accepted a first viewport") && third.contains("Restore what they accepted"), "{third}");
+    assert!(!third.contains("present the first-viewport review"), "{third}");
 }
 
 #[test]
@@ -1072,7 +1095,7 @@ fn accepted_first_viewport_turns_the_overall_bar_into_an_advisory() {
     // A stale approval (another rendering) closes nothing.
     let (stale, report) = run_reviewed_hero_min(&current, Some(&reviewed_hero(false, true)), REVIEWED_PAGE, 0.999);
     assert!(!stale.ok && !bar(&stale), "{:?}", stale.reasons);
-    assert!(stale.reasons[0].starts_with("the hero capture no longer matches the first viewport the user accepted") && stale.reasons[0].contains("changed: headline") && stale.reasons[0].contains("new first-viewport review"), "{:?}", stale.reasons);
+    assert!(stale.reasons[0].starts_with("the hero capture no longer matches the first viewport the user accepted") && stale.reasons[0].contains("changed: headline") && stale.reasons[0].ends_with("Restore what the user accepted; until then the readings apply.") && !stale.reasons[0].contains("review"), "{:?}", stale.reasons);
     assert!(stale.advisories.iter().any(|a| a.starts_with("(measured) hero overall")), "the raw score is kept as a measurement: {:?}", stale.advisories);
     assert_eq!(report["humanHeroReview"]["viewportAccepted"], false);
     // The material veto still blocks under an accepted, below-bar viewport.
@@ -1115,6 +1138,6 @@ fn responsive_does_not_relitigate_an_accepted_first_viewport_score() {
     // A later edit that changes the first viewport: the acceptance lapses and the gate says so.
     let lapsed = run(Some(&comp));
     assert!(!lapsed.ok);
-    assert!(lapsed.reasons.iter().any(|r| r.starts_with("the desktop capture no longer matches the first viewport the user accepted") && r.contains("new first-viewport review")), "{:?}", lapsed.reasons);
+    assert!(lapsed.reasons.iter().any(|r| r.starts_with("the desktop capture no longer matches the first viewport the user accepted") && r.ends_with("Restore what the user accepted; until then the readings apply.")), "{:?}", lapsed.reasons);
     assert!(!lapsed.reasons.iter().any(|r| r.contains("does not survive a common desktop width")), "{:?}", lapsed.reasons);
 }

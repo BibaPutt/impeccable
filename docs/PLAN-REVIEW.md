@@ -6,7 +6,7 @@ Comp-led builds fail most expensively when the agent decides a painted region (a
 
 `comps → spec → plates → [plan and asset review] → hero → [first-viewport review] → sections → motion → responsive → review`
 
-The review opens once every raster region has its plate. Nothing in the page is written before it. `build-phase advance` from plates (and `record hero`) refuses until the review for the current build journey is accepted and its reviewed spec digest equals the current `.impeccable/build/spec.json`. A later spec change (for example a reclassified region) needs a new round; unchanged decisions carry over.
+The review opens once every raster region has its plate. Nothing in the page is written before it. `build-phase advance` from plates or hero (and `record hero`) refuses until the review for the current build journey is accepted, its reviewed spec digest equals the current `.impeccable/build/spec.json`, and the plates it pinned are unchanged. A later spec change (for example a reclassified region) or a replaced plate needs a new round; unchanged decisions carry over. Score the plates before opening the review, so a plate fixed for the gate does not reopen it.
 
 ## Packet: schemaVersion 3, stage `components`
 
@@ -68,14 +68,14 @@ v3 needs no browser. `component-review capture` records the raster-source proof 
 
 ## After feedback
 
-The agent applies the receipt: for `reclassify`, change the region's kind (and note) in the regions file, rerun `comp-spec --regions`, produce the new plates; for `revise` on an asset, regenerate the plate with the feedback; for `revise` on a plan item, change the regions file as the feedback says, rerun `comp-spec --regions` and produce any new plates. Then `component-review plan`, `capture`, `serve` again. Unchanged decisions carry.
+The agent applies the receipt: for `reclassify`, change the region's kind (and note) in the regions file, rerun `comp-spec --comp <comp.png> --regions <regions.json>`, produce the new plates; for `revise` on an asset, regenerate the plate with the feedback; for `revise` on a plan item, change the regions file as the feedback says, rerun `comp-spec --comp <comp.png> --regions <regions.json>` and produce any new plates. Then `component-review plan`, `capture`, `serve` again. Unchanged decisions carry.
 
 ## Hero
 
 The first-viewport review is unchanged in form. Two rule changes:
 
-- After three failed hero attempts, the gate's message says to present the first-viewport review instead of continuing to iterate.
-- An accepted first-viewport review for the current capture ends the numeric fight: the overall bar, the palette check and every numeric reading become advisories, in the hero gate and in the responsive and finish rechecks of the same viewport. Only material vetoes stay hard: a missing or unreferenced plate, an SVG illustration, an organic clip, a clipped plate, invented ink, and failed rendered presence. The approval binds to the capture: the approved screenshot has to match the current hero frame (overall at least 95%, nothing missing or contradicted), so a stale approval waives nothing. The binding is visual, not by source bytes: sections, motion and responsive work edit shared CSS freely, and the waiver holds while the first viewport still looks like the accepted screenshot. When it visibly changes, the gate says the first viewport differs from what the user accepted and asks for a new first-viewport review instead of quoting a raw score. A tiled ground whose repeats cannot land on the comp's positions is the case this exists for.
+- After three failed hero attempts, the gate's message says to present the first-viewport review instead of continuing to iterate. When a first viewport is already accepted, it says to restore what the user accepted instead.
+- An accepted first-viewport review for the current capture ends the numeric fight: the overall bar, the palette check and every numeric reading become advisories, in the hero gate and in the responsive and finish rechecks of the same viewport. Only material vetoes stay hard: a missing or unreferenced plate, an SVG illustration, an organic clip, a clipped plate, invented ink, and failed rendered presence. The approval binds to the capture: the approved screenshot has to match the current hero frame (overall at least 95%, nothing missing or contradicted), so a stale approval waives nothing. The binding is visual, not by source bytes: sections, motion and responsive work edit shared CSS freely, and the waiver holds while the first viewport still looks like the accepted screenshot. When it visibly changes, the gate says the first viewport differs from what the user accepted and asks to restore it (the readings apply until then) instead of quoting a raw score. It never asks for a new first-viewport review once one is accepted: the review store hands back the accepted session, so that request would loop. The three-failure message follows the same rule. A tiled ground whose repeats cannot land on the comp's positions is the case this exists for.
 
 ## Painted-pixel flag (`comp-spec`)
 
