@@ -162,28 +162,57 @@ fn declared_comps(payload: &Value) -> Vec<String> {
     out
 }
 
+/// Provenance of a hand. Every served hand records `handAt` (ms since the
+/// epoch) and `handDigest` (see `hand_digest`) in `<key>.state.json`: `--start`
+/// starts a new hand unless it restarts the same payload on the same key, and
+/// `--update` always starts one. A declared comp belongs to the hand only when
+/// its file exists and was written at or after `handAt`, so a file an earlier
+/// round left at a reused slot path is stale, never this hand's comp.
+fn hand_digest(payload: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(json_compact(payload).as_bytes());
+    d.iter().take(8).map(|b| format!("{:02x}", b)).collect()
+}
+
+fn state_hand_at(state: &Map<String, Value>) -> Option<f64> {
+    state.get("handAt").and_then(Value::as_f64)
+}
+
+/// The comp round generates its three comps directly in `.impeccable/mocks/`
+/// before it serves them, so they are that hand's by construction and never
+/// judged by timestamp.
+fn comp_is_this_hands(cwd: &str, comp: &str, hand_at: Option<f64>) -> bool {
+    let abs = jsp::resolve(cwd, &[comp]);
+    if !exists(&abs) {
+        return false;
+    }
+    let Some(hand_at) = hand_at else { return true };
+    if is_comp_round_comp(comp) {
+        return true;
+    }
+    // Whole seconds: a filesystem with coarse mtimes must not push a comp
+    // written just after the hand began to before it.
+    let floor = (hand_at / 1000.0).floor() * 1000.0;
+    mtime_ms(&abs).map(|m| m >= floor).unwrap_or(false)
+}
+
+/// Declared comps whose file exists but predates the hand.
+fn stale_comps(cwd: &str, comps: &[String], hand_at: Option<f64>) -> Vec<String> {
+    comps.iter().filter(|c| exists(&jsp::resolve(cwd, &[c.as_str()])) && !comp_is_this_hands(cwd, c, hand_at)).cloned().collect()
+}
+
+fn any_comp_pending(cwd: &str, comps: &[String], hand_at: Option<f64>) -> bool {
+    comps.iter().any(|c| !comp_is_this_hands(cwd, c, hand_at))
+}
+
 /// A round whose comps get generated now: it is not code-led (a code-led
-/// round's slots are a flip reserve) and a declared local comp slot is still
-/// owed. On `--start` a slot is owed when its file is not on disk: a fresh
-/// decision round serves first and generates after, while a restart after a
-/// server failure reopens the page on comps that already landed and must not
-/// regenerate them. A new hand arrives through `--update` (`new_hand`), and a
-/// re-roll often reuses the previous hand's slot paths, so there every
-/// decision slot (under `mocks/decision/`) is owed whatever is on disk. The
-/// comp round serves comps that already exist directly in `mocks/`, so it
-/// never qualifies either way.
-fn comps_expected(payload: &Value, cwd: &str, new_hand: bool) -> bool {
+/// round's slots are a flip reserve) and a declared local comp slot still has
+/// no comp of this hand. A fresh decision round serves first and generates
+/// after; a restart of the same hand finds the comps that already landed; the
+/// comp round's comps are its own.
+fn comps_expected(payload: &Value, cwd: &str, hand_at: Option<f64>) -> bool {
     let code_led = payload.pointer("/buildPath/value").and_then(Value::as_str) == Some("code");
-    let comps = declared_comps(payload);
-    !code_led && ((new_hand && comps.iter().any(|c| is_decision_slot(c))) || any_comp_pending(cwd, &comps))
-}
-
-fn is_decision_slot(path: &str) -> bool {
-    path.replace('\\', "/").contains("mocks/decision/")
-}
-
-fn any_comp_pending(cwd: &str, comps: &[String]) -> bool {
-    comps.iter().any(|c| !exists(&jsp::resolve(cwd, &[c.as_str()])))
+    !code_led && any_comp_pending(cwd, &declared_comps(payload), hand_at)
 }
 
 fn visualize_ref(env: &Env, cwd: &str) -> String {
@@ -199,16 +228,22 @@ fn visualize_next_line(env: &Env, cwd: &str) -> String {
     )
 }
 
-/// Declared comps that landed on disk without a `<comp>.json` prompt sidecar.
-fn comps_missing_sidecar(cwd: &str, comps: &[String]) -> Vec<String> {
+/// This hand's landed comps without a `<comp>.json` prompt sidecar.
+fn comps_missing_sidecar(cwd: &str, comps: &[String], hand_at: Option<f64>) -> Vec<String> {
     comps
         .iter()
-        .filter(|c| {
-            let abs = jsp::resolve(cwd, &[c.as_str()]);
-            exists(&abs) && !exists(&format!("{}.json", abs))
-        })
+        .filter(|c| comp_is_this_hands(cwd, c, hand_at) && !exists(&format!("{}.json", jsp::resolve(cwd, &[c.as_str()]))))
         .cloned()
         .collect()
+}
+
+/// The `--wait` note for files an earlier round left at this hand's slots.
+fn stale_comps_line(env: &Env, cwd: &str, stale: &[String]) -> String {
+    format!(
+        "COMP STALE: files left from an earlier round sit at this hand's slots, and the page is showing them: {}. Regenerate each into its slot now under the comp rules in {}, with its prompt sidecar, before the user decides.\n",
+        stale.join(", "),
+        visualize_ref(env, cwd)
+    )
 }
 
 /// The `--wait` backstop: names every landed decision comp with no sidecar.
@@ -218,6 +253,28 @@ fn sidecar_missing_line(env: &Env, cwd: &str, missing: &[String]) -> String {
         missing.join(", "),
         visualize_ref(env, cwd)
     )
+}
+
+/// The hand a `--start` serves. Same key and same payload as the recorded
+/// hand is a restart, which keeps that hand's `handAt` so the comps that
+/// already landed stay its own; anything else is a new hand from now.
+fn start_hand_at(qdir: &str, key: &str, payload: &Value) -> f64 {
+    read_state(qdir, key)
+        .filter(|s| s.get("handDigest").and_then(Value::as_str) == Some(hand_digest(payload).as_str()))
+        .and_then(|s| state_hand_at(&s))
+        .unwrap_or_else(|| now_ms().floor())
+}
+
+/// Writes a hand's `comps`, `handAt`, and `handDigest` into a state map.
+fn record_hand(state: &mut Map<String, Value>, payload: &Value, hand_at: f64) {
+    let comps = declared_comps(payload);
+    if comps.is_empty() {
+        state.remove("comps");
+    } else {
+        state.insert("comps".into(), json!(comps));
+    }
+    state.insert("handAt".into(), Value::from(hand_at as i64));
+    state.insert("handDigest".into(), Value::from(hand_digest(payload)));
 }
 
 /// The comps recorded for the live round in `<key>.state.json`.
@@ -324,14 +381,15 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                 io.out("BUILD PATH FLIPPED: comp (for this session only; never write it to settings). The table is still open and the page shows shimmer where the images will land: generate each open card’s comp into its declared path now, lead first, then collect the answer with --wait again. A card whose comp already exists needs nothing.\n");
                 // State without comps (a round from before comps were recorded)
                 // still gets the line; a round whose comps all landed does not.
-                let comps = read_state(&qdir, &key).map(|s| state_comps(&s)).unwrap_or_default();
-                if comps.is_empty() || any_comp_pending(&cwd, &comps) {
+                let st = read_state(&qdir, &key).unwrap_or_default();
+                let comps = state_comps(&st);
+                if comps.is_empty() || any_comp_pending(&cwd, &comps, state_hand_at(&st)) {
                     io.out(&visualize_next_line(&env, &cwd));
                 }
                 return 0;
             }
             if !is_alive(&qdir, &key) {
-                io.out("serve-question: the question server is gone with no answer. This is a server failure, not a user decision: restart it with --start and the same payload, reopen the URL for the user, and wait again. Never proceed without their choice while their browser session is open.\n");
+                io.out(&format!("serve-question: the question server is gone with no answer. This is a server failure, not a user decision: restart it with --start --key {} and the same payload, reopen the URL for the user, and wait again. Never proceed without their choice while their browser session is open.\n", key));
                 return 2;
             }
             if let Some(state) = read_state(&qdir, &key) {
@@ -353,11 +411,21 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             return 4;
         }
         // Read before the answer path may delete the state file.
-        let missing = read_state(&qdir, &key).map(|s| comps_missing_sidecar(&cwd, &state_comps(&s))).unwrap_or_default();
+        let (missing, stale) = read_state(&qdir, &key)
+            .map(|s| {
+                let (comps, hand_at) = (state_comps(&s), state_hand_at(&s));
+                (comps_missing_sidecar(&cwd, &comps, hand_at), stale_comps(&cwd, &comps, hand_at))
+            })
+            .unwrap_or_default();
         if !answered() {
             io.out(&format!("WAITING: no answer yet after {}s; run --wait --key {} again\n", crate::util::js_number_to_string(poll_sec), key));
             if !missing.is_empty() {
                 io.out(&sidecar_missing_line(&env, &cwd, &missing));
+            }
+            // Only while the user is still deciding: once they pick, the image
+            // they saw is the one they chose.
+            if !stale.is_empty() {
+                io.out(&stale_comps_line(&env, &cwd, &stale));
             }
             return 3;
         }
@@ -420,7 +488,13 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         let _ = std::fs::copy(jsp::resolve(&cwd, &[&pp]), &delivered);
         touch_now(&delivered);
         io.out("next round delivered; the page reloads itself\n");
-        if comps_expected(&next_round, &cwd, true) {
+        // A delivered round is always a new hand.
+        let hand_at = now_ms().floor();
+        if let Some(mut s) = read_state(&qdir, &key) {
+            record_hand(&mut s, &next_round, hand_at);
+            let _ = std::fs::write(state_file(&qdir, &key), json_compact(&Value::Object(s)));
+        }
+        if comps_expected(&next_round, &cwd, Some(hand_at)) {
             io.out(&visualize_next_line(&env, &cwd));
         }
         return 0;
@@ -440,6 +514,11 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         };
         let _ = std::fs::create_dir_all(&qdir);
         let key = a.arg("key").unwrap_or_else(random_key);
+        let hand_at = start_hand_at(&qdir, &key, &start_payload);
+        // The old state goes either way, so the wait below sees the new
+        // server's state, not the dead one's; its pid is never signalled,
+        // since a dead server's pid may have been reused.
+        let _ = std::fs::remove_file(state_file(&qdir, &key));
         let log_file = jsp::join(&[&qdir, &format!("{}.log", key)]);
         let log = std::fs::OpenOptions::new().append(true).create(true).open(&log_file);
         let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "impeccable".to_string());
@@ -452,6 +531,8 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             key.clone(),
             "--timeout".into(),
             crate::util::js_number_to_string(timeout_sec),
+            "--hand-at".into(),
+            crate::util::js_number_to_string(hand_at),
         ];
         if let Some(g) = a.arg("idle-grace") {
             child_args.push("--idle-grace".into());
@@ -501,7 +582,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         io.out(&format!("QUESTION URL: {}\n", state.get("url").map(js_str).unwrap_or_default()));
         io.out(&format!("QUESTION KEY: {}\n", key));
         io.out("Open the URL for the user now: in-app browser when the harness has one, otherwise the system opener (macOS `open`, Linux `xdg-open`), otherwise show the URL.\n");
-        if comps_expected(&start_payload, &cwd, false) {
+        if comps_expected(&start_payload, &cwd, Some(hand_at)) {
             io.out(&visualize_next_line(&env, &cwd));
         }
         io.out(&format!("Then collect the answer with: {} --wait --key {}\n", crate::provider::detect(&env, &cwd).verb_cmd("serve-question"), key));
@@ -542,9 +623,9 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         let _ = std::fs::create_dir_all(&qdir);
         let key = a.arg("key").unwrap_or_default();
         let mut st = json!({ "pid": std::process::id(), "port": actual_port, "url": url });
-        let comps = declared_comps(&state.lock().unwrap().payload);
-        if !comps.is_empty() {
-            st["comps"] = json!(comps);
+        if let Some(m) = st.as_object_mut() {
+            let hand_at = a.arg("hand-at").and_then(|v| v.parse::<f64>().ok()).unwrap_or_else(|| now_ms().floor());
+            record_hand(m, &state.lock().unwrap().payload, hand_at);
         }
         let _ = std::fs::write(state_file(&qdir, &key), json_compact(&st));
     } else {
@@ -1439,35 +1520,123 @@ mod tests {
         );
     }
 
+    /// Writes a file whose mtime lies `secs` seconds in the past: a comp an
+    /// earlier round left behind.
+    fn write_aged(path: &std::path::Path, secs: u64) {
+        std::fs::write(path, b"img").unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+    }
+
+    fn write_state(dir: &std::path::Path, state: &Value) {
+        std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
+    }
+
     #[test]
     fn comps_expected_only_for_pending_comp_slots_outside_a_code_led_round() {
         let dir = temp_project("expected");
         let cwd = dir.to_string_lossy().into_owned();
+        let now = Some(now_ms().floor());
         let with = json!({ "options": [{ "id": "a", "comp": "m/a.png" }] });
-        assert!(comps_expected(&with, &cwd, false));
+        assert!(comps_expected(&with, &cwd, now));
         let comp_led = json!({ "options": [{ "id": "a", "comp": "m/a.png" }], "buildPath": { "value": "comp", "toggle": true } });
-        assert!(comps_expected(&comp_led, &cwd, false));
+        assert!(comps_expected(&comp_led, &cwd, now));
         let code_led = json!({ "options": [{ "id": "a", "comp": "m/a.png" }], "buildPath": { "value": "code", "toggle": true } });
-        assert!(!comps_expected(&code_led, &cwd, false));
+        assert!(!comps_expected(&code_led, &cwd, now));
         let wireframes = json!({ "options": [{ "id": "a", "wireframe": { "cols": 12 } }] });
-        assert!(!comps_expected(&wireframes, &cwd, false));
+        assert!(!comps_expected(&wireframes, &cwd, now));
         let urls_only = json!({ "options": [{ "id": "a", "comp": "https://x/a.png" }] });
-        assert!(!comps_expected(&urls_only, &cwd, false));
-        // The comp round serves comps that already exist: nothing is left to prompt.
-        std::fs::write(dir.join(".impeccable/mocks/comp-a.png"), b"png").unwrap();
-        std::fs::write(dir.join(".impeccable/mocks/comp-b.png"), b"png").unwrap();
+        assert!(!comps_expected(&urls_only, &cwd, now));
+        // The comp round generates before it serves: its comps predate the hand
+        // and are still its own.
+        write_aged(&dir.join(".impeccable/mocks/comp-a.png"), 120);
+        write_aged(&dir.join(".impeccable/mocks/comp-b.png"), 120);
         let comp_round = json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/comp-a.png" }, { "id": "b", "comp": ".impeccable/mocks/comp-b.png" }] });
-        assert!(!comps_expected(&comp_round, &cwd, false));
+        assert!(!comps_expected(&comp_round, &cwd, now));
         // One slot still empty is enough.
         let partial = json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/comp-a.png" }, { "id": "c", "comp": ".impeccable/mocks/comp-c.png" }] });
-        assert!(comps_expected(&partial, &cwd, false));
-        // A re-roll reusing the previous hand's decision slots still owes new comps.
-        std::fs::create_dir_all(dir.join(".impeccable/mocks/decision")).unwrap();
-        std::fs::write(dir.join(".impeccable/mocks/decision/assigned.webp"), b"webp").unwrap();
-        let reroll = json!({ "options": [{ "id": "assigned", "comp": ".impeccable/mocks/decision/assigned.webp" }] });
-        assert!(comps_expected(&reroll, &cwd, true));
-        // A restart reopens the same hand on comps that already landed: nothing to regenerate.
-        assert!(!comps_expected(&reroll, &cwd, false));
+        assert!(comps_expected(&partial, &cwd, now));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_comp_counts_for_the_hand_only_when_written_at_or_after_hand_at() {
+        let dir = temp_project("provenance");
+        let cwd = dir.to_string_lossy().into_owned();
+        let slot = ".impeccable/mocks/decision/assigned.webp";
+        let payload = json!({ "options": [{ "id": "assigned", "comp": slot }] });
+        write_aged(&dir.join(slot), 120);
+        let hand_at = now_ms().floor();
+        // A file an earlier round left at the slot is stale, not this hand's.
+        assert!(!comp_is_this_hands(&cwd, slot, Some(hand_at)));
+        assert_eq!(stale_comps(&cwd, &[slot.to_string()], Some(hand_at)), vec![slot.to_string()]);
+        assert!(comps_expected(&payload, &cwd, Some(hand_at)));
+        // Written after the hand began: this hand's.
+        std::fs::write(dir.join(slot), b"img").unwrap();
+        assert!(comp_is_this_hands(&cwd, slot, Some(hand_at)));
+        assert!(!comps_expected(&payload, &cwd, Some(hand_at)));
+        // State from before hands were recorded falls back to existence.
+        write_aged(&dir.join(slot), 120);
+        assert!(comp_is_this_hands(&cwd, slot, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn start_restarts_the_same_hand_and_starts_a_new_one_otherwise() {
+        let dir = temp_project("start-hand");
+        let cwd = dir.to_string_lossy().into_owned();
+        let qdir = jsp::join(&[&cwd, ".impeccable", "questions"]);
+        let slot = ".impeccable/mocks/decision/a.png";
+        let hand1 = json!({ "title": "Pick", "options": [{ "id": "a", "comp": slot }] });
+        let hand2 = json!({ "title": "Pick again", "options": [{ "id": "a", "comp": slot }] });
+
+        // Fresh start, a stale file at the slot from an earlier session: NEXT.
+        write_aged(&dir.join(slot), 600);
+        let fresh = start_hand_at(&qdir, "k1", &hand1);
+        assert!(now_ms() - fresh < 5000.0);
+        assert!(comps_expected(&hand1, &cwd, Some(fresh)));
+
+        // Restart of the same payload on the same key after its comp landed: no NEXT.
+        let t1 = now_ms().floor() - 60_000.0;
+        let mut st = Map::new();
+        record_hand(&mut st, &hand1, t1);
+        write_state(&dir, &Value::Object(st));
+        write_aged(&dir.join(slot), 30);
+        let restart = start_hand_at(&qdir, "k1", &hand1);
+        assert_eq!(restart, t1);
+        assert!(!comps_expected(&hand1, &cwd, Some(restart)));
+
+        // A different payload on that key is a new hand: the landed file is stale.
+        let other = start_hand_at(&qdir, "k1", &hand2);
+        assert!(other > t1);
+        assert!(comps_expected(&hand2, &cwd, Some(other)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reroll_reusing_slots_owes_comps_until_they_land_even_across_a_restart() {
+        let dir = temp_project("reroll-hand");
+        let cwd = dir.to_string_lossy().into_owned();
+        let qdir = jsp::join(&[&cwd, ".impeccable", "questions"]);
+        let slot = ".impeccable/mocks/decision/a.png";
+        // The first hand's comp landed at the slot the re-roll reuses.
+        write_aged(&dir.join(slot), 120);
+        write_state(&dir, &json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/" }));
+        let reroll = json!({ "title": "Round 2", "options": [{ "id": "a", "comp": slot }] });
+        std::fs::write(dir.join("reroll.json"), reroll.to_string()).unwrap();
+        let (code, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "reroll.json"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("NEXT read "), "{out}");
+        let st = read_state(&qdir, "k1").unwrap();
+        assert_eq!(state_comps(&st), vec![slot.to_string()]);
+        assert_eq!(st.get("handDigest").and_then(Value::as_str), Some(hand_digest(&reroll).as_str()));
+        let hand_at = state_hand_at(&st).unwrap();
+
+        // The server dies before the new comp lands; a restart of the re-roll
+        // payload keeps the re-roll's hand, so the old file still does not count.
+        let restart = start_hand_at(&qdir, "k1", &reroll);
+        assert_eq!(restart, hand_at);
+        assert!(comps_expected(&reroll, &cwd, Some(restart)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1540,6 +1709,21 @@ mod tests {
         std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
         let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
         assert!(!out.contains("COMP SIDECAR MISSING"), "{out}");
+
+        // A file an earlier round left at a slot is named stale while the user
+        // decides, never as a missing sidecar, and not after the pick.
+        std::fs::remove_file(dir.join(format!("{}.json", comps[0]))).unwrap();
+        write_aged(&dir.join(comps[0]), 120);
+        let mut hand = state.clone();
+        hand["handAt"] = json!(now_ms().floor() as i64);
+        std::fs::write(dir.join(".impeccable/questions/k1.state.json"), hand.to_string()).unwrap();
+        let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
+        let out = out.replace('\\', "/");
+        assert!(!out.contains("COMP SIDECAR MISSING"), "{out}");
+        assert!(out.contains("COMP STALE: files left from an earlier round sit at this hand's slots, and the page is showing them: .impeccable/mocks/decision/a.png."), "{out}");
+        std::fs::write(dir.join(".impeccable/questions/k1.answer.json"), r#"{"optionId":"a"}"#).unwrap();
+        let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
+        assert!(!out.contains("COMP STALE") && !out.contains("COMP SIDECAR MISSING"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1561,12 +1745,12 @@ mod tests {
         assert!(!out.contains("NEXT"), "{out}");
 
         // A re-roll into the same decision slot still owes a new comp.
-        std::fs::write(dir.join(".impeccable/mocks/decision/a.png"), b"png").unwrap();
+        write_aged(&dir.join(".impeccable/mocks/decision/a.png"), 120);
         let (_, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "comp.json"]);
         assert!(out.contains("NEXT read "), "{out}");
 
         // A comp round serves comps already on disk directly in mocks/: no NEXT line.
-        std::fs::write(dir.join(".impeccable/mocks/comp-a.png"), b"png").unwrap();
+        write_aged(&dir.join(".impeccable/mocks/comp-a.png"), 120);
         std::fs::write(dir.join("round.json"), json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/comp-a.png" }] }).to_string()).unwrap();
         let (_, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "round.json"]);
         assert_eq!(out, "next round delivered; the page reloads itself\n");
@@ -1593,6 +1777,14 @@ mod tests {
         std::fs::write(dir.join(".impeccable/questions/k1.flip.json"), r#"{"buildPath":"comp"}"#).unwrap();
         let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
         assert!(out.starts_with("BUILD PATH FLIPPED: comp") && !out.contains("NEXT"), "{out}");
+
+        // A file older than the hand is not this hand's comp: still owed.
+        write_aged(&dir.join(".impeccable/mocks/decision/a.png"), 120);
+        let state = json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/", "comps": [".impeccable/mocks/decision/a.png"], "handAt": now_ms().floor() as i64 });
+        std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
+        std::fs::write(dir.join(".impeccable/questions/k1.flip.json"), r#"{"buildPath":"comp"}"#).unwrap();
+        let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
+        assert!(out.contains("\nNEXT read "), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
