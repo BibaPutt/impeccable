@@ -187,8 +187,86 @@ fn file_fingerprint(abs: &str) -> Option<String> {
     Some(Sha256::digest(&bytes).iter().map(|b| format!("{:02x}", b)).collect())
 }
 
+/// `<key>.generated/`: one marker per slot `impeccable generate-image` wrote
+/// during the hand, `<sha16 of slot>.json` = `{"slot", "digest"}`. A marker
+/// file per slot rather than a list inside the hand file, because parallel
+/// generators (one subagent per card) would race a shared read-modify-write.
+fn generated_dir(qdir: &str, key: &str) -> String {
+    jsp::join(&[qdir, &format!("{}.generated", key)])
+}
+
+/// The recorded hand, with the slots generated during it merged in as
+/// `generated` (markers from another digest are ignored).
 fn read_hand(qdir: &str, key: &str) -> Option<Map<String, Value>> {
-    safe_read(&hand_file(qdir, key)).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned())
+    let mut hand = safe_read(&hand_file(qdir, key)).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned())?;
+    let digest = hand.get("digest").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut generated: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(generated_dir(qdir, key)) {
+        for e in entries.flatten() {
+            let Some(m) = safe_read(&e.path().to_string_lossy()).and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
+            if m.get("digest").and_then(Value::as_str) == Some(digest.as_str()) {
+                if let Some(slot) = m.get("slot").and_then(Value::as_str) {
+                    generated.push(slot.to_string());
+                }
+            }
+        }
+    }
+    generated.sort();
+    if !generated.is_empty() {
+        hand.insert("generated".into(), json!(generated));
+    }
+    Some(hand)
+}
+
+/// Temp file beside the target, then rename: a reader never sees half a file.
+fn write_atomic(target: &str, text: &str) -> std::io::Result<()> {
+    let temp = format!("{}.tmp-{}", target, std::process::id());
+    std::fs::write(&temp, text)?;
+    std::fs::rename(&temp, target).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        e
+    })
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    let norm = |p: &str| {
+        let p = p.replace('\\', "/");
+        if cfg!(windows) { p.to_lowercase() } else { p }
+    };
+    norm(a) == norm(b)
+}
+
+/// Called by `impeccable generate-image` after it writes `out`: when `out` is
+/// a declared slot of a recorded hand in this project, mark it generated
+/// during that hand. A deterministic generator returns the same bytes for
+/// the same prompt, which the fingerprint rule alone would read as stale.
+/// Returns the keys whose hand was marked, or the first write error.
+pub fn record_generated(cwd: &str, out: &str) -> Result<Vec<String>, String> {
+    let qdir = jsp::join(&[cwd, ".impeccable", "questions"]);
+    let out_abs = jsp::resolve(cwd, &[out]);
+    let Ok(entries) = std::fs::read_dir(&qdir) else { return Ok(vec![]) };
+    let mut keys: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".hand.json").map(str::to_string))
+        .collect();
+    keys.sort();
+    let mut marked = Vec::new();
+    for key in keys {
+        let Some(hand) = read_hand(&qdir, &key) else { continue };
+        let digest = hand.get("digest").and_then(Value::as_str).unwrap_or("").to_string();
+        for slot in round_comps(Some(&hand), None) {
+            if !same_path(&jsp::resolve(cwd, &[slot.as_str()]), &out_abs) {
+                continue;
+            }
+            let dir = generated_dir(&qdir, &key);
+            let marker = jsp::join(&[&dir, &format!("{}.json", hand_digest(&Value::String(slot.clone())))]);
+            std::fs::create_dir_all(&dir)
+                .and_then(|_| write_atomic(&marker, &json_compact(&json!({ "slot": slot, "digest": digest }))))
+                .map_err(|e| format!("{}: {}", marker, e))?;
+            marked.push(key.clone());
+        }
+    }
+    Ok(marked)
 }
 
 /// A new hand: its digest, its slots, and the fingerprint of every slot that
@@ -209,25 +287,25 @@ fn new_hand(cwd: &str, payload: &Value) -> Map<String, Value> {
 }
 
 /// Temp file then rename, so a reader never sees half a hand.
-fn write_hand(qdir: &str, key: &str, hand: &Map<String, Value>) {
+/// Records a new hand: clears the previous hand's generated markers, then
+/// writes the hand file atomically. The error names the file.
+fn write_hand(qdir: &str, key: &str, hand: &Map<String, Value>) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(generated_dir(qdir, key));
     let target = hand_file(qdir, key);
-    let temp = format!("{}.tmp-{}", target, std::process::id());
-    if std::fs::write(&temp, json_compact(&Value::Object(hand.clone()))).is_ok() && std::fs::rename(&temp, &target).is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
+    write_atomic(&target, &json_compact(&Value::Object(hand.clone()))).map_err(|e| format!("{}: {}", target, e))
 }
 
 /// The hand a `--start` serves: the recorded one when the key's hand file
 /// carries this payload's digest (a restart keeps its fingerprints), else a
 /// new one, written before the server spawns.
-fn start_hand(qdir: &str, key: &str, cwd: &str, payload: &Value) -> Map<String, Value> {
+fn start_hand(qdir: &str, key: &str, cwd: &str, payload: &Value) -> Result<Map<String, Value>, String> {
     let digest = hand_digest(payload);
     if let Some(h) = read_hand(qdir, key).filter(|h| h.get("digest").and_then(Value::as_str) == Some(digest.as_str())) {
-        return h;
+        return Ok(h);
     }
     let h = new_hand(cwd, payload);
-    write_hand(qdir, key, &h);
-    h
+    write_hand(qdir, key, &h)?;
+    Ok(h)
 }
 
 /// The comps a `--wait` judges: the hand's, else the state's (a round served
@@ -250,6 +328,10 @@ fn comp_is_this_hands(cwd: &str, comp: &str, hand: Option<&Map<String, Value>>) 
     }
     let Some(hand) = hand else { return true };
     if is_comp_round_comp(comp) {
+        return true;
+    }
+    let generated = hand.get("generated").and_then(Value::as_array).map(|g| g.iter().any(|v| v.as_str() == Some(comp))).unwrap_or(false);
+    if generated {
         return true;
     }
     match hand.get("pre").and_then(|p| p.get(comp)).and_then(Value::as_str) {
@@ -525,13 +607,18 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             io.err("serve-question: no live question server for that key; the page it served is gone too. Re-present the round with --start and a fresh key, or fall back to the structured question tool.\n");
             return 2;
         }
+        // A delivered round is always a new hand. Recorded before delivery:
+        // on failure the page keeps the previous round, whose hand file is
+        // untouched, so nothing is served without its provenance.
+        let hand = new_hand(&cwd, &next_round);
+        if let Err(e) = write_hand(&qdir, &key, &hand) {
+            io.err(&format!("serve-question: could not record the hand ({}); nothing was delivered. Make .impeccable/questions/ writable and rerun --update on the same key.\n", e));
+            return 1;
+        }
         let delivered = next_file(&qdir, &key);
         let _ = std::fs::copy(jsp::resolve(&cwd, &[&pp]), &delivered);
         touch_now(&delivered);
         io.out("next round delivered; the page reloads itself\n");
-        // A delivered round is always a new hand.
-        let hand = new_hand(&cwd, &next_round);
-        write_hand(&qdir, &key, &hand);
         if comps_expected(&next_round, &cwd, Some(&hand)) {
             io.out(&visualize_next_line(&env, &cwd));
         }
@@ -552,7 +639,13 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         };
         let _ = std::fs::create_dir_all(&qdir);
         let key = a.arg("key").unwrap_or_else(random_key);
-        let hand = start_hand(&qdir, &key, &cwd, &start_payload);
+        let hand = match start_hand(&qdir, &key, &cwd, &start_payload) {
+            Ok(h) => h,
+            Err(e) => {
+                io.err(&format!("serve-question: could not record the hand ({}); the page was not served. Make .impeccable/questions/ writable and rerun --start.\n", e));
+                return 1;
+            }
+        };
         // The old state goes either way, so the wait below sees the new
         // server's state, not the dead one's; its pid is never signalled,
         // since a dead server's pid may have been reused.
@@ -1635,19 +1728,19 @@ mod tests {
 
         // Fresh start, a file an earlier session left at the slot: NEXT.
         write_file(&dir.join(slot), b"earlier session");
-        let fresh = start_hand(&qdir, "k1", &cwd, &hand1);
+        let fresh = start_hand(&qdir, "k1", &cwd, &hand1).unwrap();
         assert!(comps_expected(&hand1, &cwd, Some(&fresh)));
         assert_eq!(read_hand(&qdir, "k1").as_ref(), Some(&fresh));
 
         // The comp lands; the server dies; a restart of the same payload on the
         // same key keeps the recorded fingerprints: no NEXT.
         write_file(&dir.join(slot), b"this hand");
-        let restart = start_hand(&qdir, "k1", &cwd, &hand1);
+        let restart = start_hand(&qdir, "k1", &cwd, &hand1).unwrap();
         assert_eq!(restart, fresh);
         assert!(!comps_expected(&hand1, &cwd, Some(&restart)));
 
         // A different payload on that key is a new hand: the landed file is stale.
-        let other = start_hand(&qdir, "k1", &cwd, &hand2);
+        let other = start_hand(&qdir, "k1", &cwd, &hand2).unwrap();
         assert_ne!(other, fresh);
         assert!(comps_expected(&hand2, &cwd, Some(&other)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1673,7 +1766,7 @@ mod tests {
 
         // The server dies before the new comp lands; a restart of the re-roll
         // payload keeps the re-roll's hand, so the old file still does not count.
-        let restart = start_hand(&qdir, "k1", &cwd, &reroll);
+        let restart = start_hand(&qdir, "k1", &cwd, &reroll).unwrap();
         assert_eq!(restart, hand);
         assert!(comps_expected(&reroll, &cwd, Some(&restart)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1703,6 +1796,78 @@ mod tests {
         let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
         let out = out.replace('\\', "/");
         assert!(out.contains("COMP STALE: ") && out.contains(slot), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deterministic_regeneration_into_a_reused_slot_counts_via_generated() {
+        let dir = temp_project("regen");
+        let cwd = dir.to_string_lossy().into_owned();
+        let qdir = jsp::join(&[&cwd, ".impeccable", "questions"]);
+        let slot = ".impeccable/mocks/decision/a.png";
+        let gen = |out: &str| {
+            let env = Env::from([("IMPECCABLE_IMAGE_GEN_FAKE".into(), "1".into())]);
+            let (mut io, cap) = Io::captured("", dir.clone(), env);
+            let args: Vec<String> = ["--prompt", "Same prompt, same bytes.", "--out", out, "--size", "64x40"].iter().map(|s| s.to_string()).collect();
+            let code = crate::generate_image::run(&args, &mut io);
+            assert_eq!(code, 0, "{}", String::from_utf8_lossy(&cap.stderr.borrow()));
+        };
+        // The previous hand generated into the slot.
+        gen(slot);
+        let before = std::fs::read(dir.join(slot)).unwrap();
+        write_state(&dir, &json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/" }));
+        std::fs::write(dir.join("reroll.json"), json!({ "options": [{ "id": "a", "comp": slot }] }).to_string()).unwrap();
+        let (_, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "reroll.json"]);
+        assert!(out.contains("NEXT read "), "{out}");
+        let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
+        assert!(out.contains("COMP STALE: "), "{out}");
+        // The re-roll regenerates the same prompt: identical bytes, still this hand's.
+        gen(&format!("./{}", slot));
+        assert_eq!(std::fs::read(dir.join(slot)).unwrap(), before);
+        let hand = read_hand(&qdir, "k1").unwrap();
+        assert_eq!(hand.get("generated"), Some(&json!([slot])));
+        assert!(comp_is_this_hands(&cwd, slot, Some(&hand)));
+        let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
+        assert!(!out.contains("COMP STALE"), "{out}");
+        // Rewriting the prompt sidecar alone never counts: only generation or new bytes do.
+        std::fs::write(dir.join("again.json"), json!({ "title": "3", "options": [{ "id": "a", "comp": slot }] }).to_string()).unwrap();
+        run_captured(&dir, &["--update", "--key", "k1", "--payload", "again.json"]);
+        std::fs::write(dir.join(format!("{}.json", slot)), r#"{"prompt":"rewritten"}"#).unwrap();
+        let hand = read_hand(&qdir, "k1").unwrap();
+        assert!(hand.get("generated").is_none());
+        assert!(!comp_is_this_hands(&cwd, slot, Some(&hand)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_hand_write_fails_start_and_update() {
+        let dir = temp_project("hand-fail");
+        let qdir = jsp::join(&[&dir.to_string_lossy(), ".impeccable", "questions"]);
+        // A directory where the hand file belongs: the rename cannot land, on
+        // every platform.
+        std::fs::create_dir_all(hand_file(&qdir, "k1")).unwrap();
+        std::fs::write(dir.join("p.json"), json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/decision/a.png" }] }).to_string()).unwrap();
+        let err_of = |args: &[&str]| {
+            let env = Env::from([("IMPECCABLE_SKILL_DIR".into(), "/skill".into())]);
+            let (mut io, cap) = Io::captured("", dir.clone(), env);
+            let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let code = run(&argv, &mut io);
+            let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+            let err = String::from_utf8(cap.stderr.borrow().clone()).unwrap();
+            (code, out, err)
+        };
+        let (code, out, err) = err_of(&["--start", "--no-open", "--key", "k1", "--payload", "p.json"]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "{out}");
+        assert!(err.starts_with("serve-question: could not record the hand (") && err.contains("the page was not served"), "{err}");
+        assert!(!std::path::Path::new(&state_file(&qdir, "k1")).exists());
+
+        write_state(&dir, &json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/" }));
+        let (code, out, err) = err_of(&["--update", "--key", "k1", "--payload", "p.json"]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("nothing was delivered"), "{err}");
+        assert!(!std::path::Path::new(&next_file(&qdir, "k1")).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1781,7 +1946,7 @@ mod tests {
         std::fs::remove_file(dir.join(format!("{}.json", comps[0]))).unwrap();
         let qdir = jsp::join(&[&dir.to_string_lossy(), ".impeccable", "questions"]);
         let payload = json!({ "options": comps.iter().map(|c| json!({ "comp": c })).collect::<Vec<_>>() });
-        write_hand(&qdir, "k1", &new_hand(&dir.to_string_lossy(), &payload));
+        write_hand(&qdir, "k1", &new_hand(&dir.to_string_lossy(), &payload)).unwrap();
         std::fs::remove_file(dir.join(format!("{}.json", comps[1]))).unwrap();
         std::fs::remove_file(dir.join(comps[1])).unwrap();
         let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
@@ -1849,7 +2014,7 @@ mod tests {
         // comp: still owed.
         let qdir = jsp::join(&[&dir.to_string_lossy(), ".impeccable", "questions"]);
         let payload = json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/decision/a.png" }] });
-        write_hand(&qdir, "k1", &new_hand(&dir.to_string_lossy(), &payload));
+        write_hand(&qdir, "k1", &new_hand(&dir.to_string_lossy(), &payload)).unwrap();
         std::fs::write(dir.join(".impeccable/questions/k1.flip.json"), r#"{"buildPath":"comp"}"#).unwrap();
         let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
         assert!(out.contains("\nNEXT read "), "{out}");
