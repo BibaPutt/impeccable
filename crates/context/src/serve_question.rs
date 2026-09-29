@@ -163,16 +163,19 @@ fn declared_comps(payload: &Value) -> Vec<String> {
 }
 
 /// A round whose comps get generated now: it is not code-led (a code-led
-/// round's slots are a flip reserve) and it either declares a decision slot
-/// (under `mocks/decision/`) or has a local comp slot not on disk yet. A
-/// decision round always writes its comps after serving, and a re-roll often
-/// reuses the same slot paths, so a file left by the previous hand never
-/// counts as this hand's comp. The comp round serves comps that already exist
-/// directly in `mocks/`, so it never qualifies.
-fn comps_expected(payload: &Value, cwd: &str) -> bool {
+/// round's slots are a flip reserve) and a declared local comp slot is still
+/// owed. On `--start` a slot is owed when its file is not on disk: a fresh
+/// decision round serves first and generates after, while a restart after a
+/// server failure reopens the page on comps that already landed and must not
+/// regenerate them. A new hand arrives through `--update` (`new_hand`), and a
+/// re-roll often reuses the previous hand's slot paths, so there every
+/// decision slot (under `mocks/decision/`) is owed whatever is on disk. The
+/// comp round serves comps that already exist directly in `mocks/`, so it
+/// never qualifies either way.
+fn comps_expected(payload: &Value, cwd: &str, new_hand: bool) -> bool {
     let code_led = payload.pointer("/buildPath/value").and_then(Value::as_str) == Some("code");
     let comps = declared_comps(payload);
-    !code_led && (comps.iter().any(|c| is_decision_slot(c)) || any_comp_pending(cwd, &comps))
+    !code_led && ((new_hand && comps.iter().any(|c| is_decision_slot(c))) || any_comp_pending(cwd, &comps))
 }
 
 fn is_decision_slot(path: &str) -> bool {
@@ -417,7 +420,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         let _ = std::fs::copy(jsp::resolve(&cwd, &[&pp]), &delivered);
         touch_now(&delivered);
         io.out("next round delivered; the page reloads itself\n");
-        if comps_expected(&next_round, &cwd) {
+        if comps_expected(&next_round, &cwd, true) {
             io.out(&visualize_next_line(&env, &cwd));
         }
         return 0;
@@ -498,7 +501,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         io.out(&format!("QUESTION URL: {}\n", state.get("url").map(js_str).unwrap_or_default()));
         io.out(&format!("QUESTION KEY: {}\n", key));
         io.out("Open the URL for the user now: in-app browser when the harness has one, otherwise the system opener (macOS `open`, Linux `xdg-open`), otherwise show the URL.\n");
-        if comps_expected(&start_payload, &cwd) {
+        if comps_expected(&start_payload, &cwd, false) {
             io.out(&visualize_next_line(&env, &cwd));
         }
         io.out(&format!("Then collect the answer with: {} --wait --key {}\n", crate::provider::detect(&env, &cwd).verb_cmd("serve-question"), key));
@@ -1441,28 +1444,30 @@ mod tests {
         let dir = temp_project("expected");
         let cwd = dir.to_string_lossy().into_owned();
         let with = json!({ "options": [{ "id": "a", "comp": "m/a.png" }] });
-        assert!(comps_expected(&with, &cwd));
+        assert!(comps_expected(&with, &cwd, false));
         let comp_led = json!({ "options": [{ "id": "a", "comp": "m/a.png" }], "buildPath": { "value": "comp", "toggle": true } });
-        assert!(comps_expected(&comp_led, &cwd));
+        assert!(comps_expected(&comp_led, &cwd, false));
         let code_led = json!({ "options": [{ "id": "a", "comp": "m/a.png" }], "buildPath": { "value": "code", "toggle": true } });
-        assert!(!comps_expected(&code_led, &cwd));
+        assert!(!comps_expected(&code_led, &cwd, false));
         let wireframes = json!({ "options": [{ "id": "a", "wireframe": { "cols": 12 } }] });
-        assert!(!comps_expected(&wireframes, &cwd));
+        assert!(!comps_expected(&wireframes, &cwd, false));
         let urls_only = json!({ "options": [{ "id": "a", "comp": "https://x/a.png" }] });
-        assert!(!comps_expected(&urls_only, &cwd));
+        assert!(!comps_expected(&urls_only, &cwd, false));
         // The comp round serves comps that already exist: nothing is left to prompt.
         std::fs::write(dir.join(".impeccable/mocks/comp-a.png"), b"png").unwrap();
         std::fs::write(dir.join(".impeccable/mocks/comp-b.png"), b"png").unwrap();
         let comp_round = json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/comp-a.png" }, { "id": "b", "comp": ".impeccable/mocks/comp-b.png" }] });
-        assert!(!comps_expected(&comp_round, &cwd));
+        assert!(!comps_expected(&comp_round, &cwd, false));
         // One slot still empty is enough.
         let partial = json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/comp-a.png" }, { "id": "c", "comp": ".impeccable/mocks/comp-c.png" }] });
-        assert!(comps_expected(&partial, &cwd));
+        assert!(comps_expected(&partial, &cwd, false));
         // A re-roll reusing the previous hand's decision slots still owes new comps.
         std::fs::create_dir_all(dir.join(".impeccable/mocks/decision")).unwrap();
         std::fs::write(dir.join(".impeccable/mocks/decision/assigned.webp"), b"webp").unwrap();
         let reroll = json!({ "options": [{ "id": "assigned", "comp": ".impeccable/mocks/decision/assigned.webp" }] });
-        assert!(comps_expected(&reroll, &cwd));
+        assert!(comps_expected(&reroll, &cwd, true));
+        // A restart reopens the same hand on comps that already landed: nothing to regenerate.
+        assert!(!comps_expected(&reroll, &cwd, false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
