@@ -89,6 +89,16 @@ fn is_alive(qdir: &str, key: &str) -> bool {
     }
 }
 
+/// A comp-round comp sits directly in `.impeccable/mocks/` (build-phase's
+/// comps gate lists that directory); decision comps live one level down in
+/// `.impeccable/mocks/decision/`. Anything else keeps the decision wording.
+fn is_comp_round_comp(path: &str) -> bool {
+    let p = path.replace('\\', "/");
+    let dir = p.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let dir = dir.strip_prefix("./").unwrap_or(dir);
+    dir == ".impeccable/mocks" || dir.ends_with("/.impeccable/mocks")
+}
+
 fn print_answer(io: &mut Io, raw: &str) {
     io.out(&format!("ANSWER: {}\n", raw));
     let Ok(a) = serde_json::from_str::<Value>(raw) else { return };
@@ -96,7 +106,9 @@ fn print_answer(io: &mut Io, raw: &str) {
     if truthy("hero") || truthy("board") {
         io.out("CHOSEN CARD: open the chosen world's board and hero images now, before any code. When your harness only reads files, or runs sandboxed, download them INTO the workspace and open the relative path; a sandboxed viewer rejects absolute paths outside it. They set the craft bar the build must reach.\n");
     }
-    if truthy("comp") {
+    if truthy("comp") && is_comp_round_comp(&a.get("comp").map(js_str).unwrap_or_default()) {
+        io.out("APPROVED COMP: the user picked this composition in the comp round, so it is the approved comp. Set \"approved\": true in its prompt sidecar (<comp>.json), record its path in the surface brief, then close the comps phase with build-phase advance. Build from it as it stands; never regenerate it.\n");
+    } else if truthy("comp") {
         io.out("CHOSEN COMP: the decision comp at that path is compositional option one. On a comp-led build the comp round adds two variations beside it; on a code-led build it returns at the finish review as the critique reference. Never regenerate it from scratch.\n");
     }
     let option_id = a.get("optionId").and_then(|v| v.as_str());
@@ -150,11 +162,18 @@ fn declared_comps(payload: &Value) -> Vec<String> {
     out
 }
 
-/// A round whose comps get generated now: it declares local comp slots and
-/// is not code-led (a code-led round's slots are a flip reserve).
-fn comps_expected(payload: &Value) -> bool {
+/// A round whose comps get generated now: it is not code-led (a code-led
+/// round's slots are a flip reserve) and at least one declared local comp
+/// slot is not on disk yet. The decision round serves first and generates
+/// after, so its slots are empty at `--start`; the comp round serves comps
+/// that already exist, so it never qualifies.
+fn comps_expected(payload: &Value, cwd: &str) -> bool {
     let code_led = payload.pointer("/buildPath/value").and_then(Value::as_str) == Some("code");
-    !code_led && !declared_comps(payload).is_empty()
+    !code_led && any_comp_pending(cwd, &declared_comps(payload))
+}
+
+fn any_comp_pending(cwd: &str, comps: &[String]) -> bool {
+    comps.iter().any(|c| !exists(&jsp::resolve(cwd, &[c.as_str()])))
 }
 
 fn visualize_ref(env: &Env, cwd: &str) -> String {
@@ -293,7 +312,12 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             if exists(&flip_file(&qdir, &key)) {
                 let _ = std::fs::remove_file(flip_file(&qdir, &key));
                 io.out("BUILD PATH FLIPPED: comp (for this session only; never write it to settings). The table is still open and the page shows shimmer where the images will land: generate each open card’s comp into its declared path now, lead first, then collect the answer with --wait again. A card whose comp already exists needs nothing.\n");
-                io.out(&visualize_next_line(&env, &cwd));
+                // State without comps (a round from before comps were recorded)
+                // still gets the line; a round whose comps all landed does not.
+                let comps = read_state(&qdir, &key).map(|s| state_comps(&s)).unwrap_or_default();
+                if comps.is_empty() || any_comp_pending(&cwd, &comps) {
+                    io.out(&visualize_next_line(&env, &cwd));
+                }
                 return 0;
             }
             if !is_alive(&qdir, &key) {
@@ -386,7 +410,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         let _ = std::fs::copy(jsp::resolve(&cwd, &[&pp]), &delivered);
         touch_now(&delivered);
         io.out("next round delivered; the page reloads itself\n");
-        if comps_expected(&next_round) {
+        if comps_expected(&next_round, &cwd) {
             io.out(&visualize_next_line(&env, &cwd));
         }
         return 0;
@@ -467,7 +491,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         io.out(&format!("QUESTION URL: {}\n", state.get("url").map(js_str).unwrap_or_default()));
         io.out(&format!("QUESTION KEY: {}\n", key));
         io.out("Open the URL for the user now: in-app browser when the harness has one, otherwise the system opener (macOS `open`, Linux `xdg-open`), otherwise show the URL.\n");
-        if comps_expected(&start_payload) {
+        if comps_expected(&start_payload, &cwd) {
             io.out(&visualize_next_line(&env, &cwd));
         }
         io.out(&format!("Then collect the answer with: {} --wait --key {}\n", crate::provider::detect(&env, &cwd).verb_cmd("serve-question"), key));
@@ -1406,17 +1430,57 @@ mod tests {
     }
 
     #[test]
-    fn comps_expected_only_for_comp_slots_outside_a_code_led_round() {
+    fn comps_expected_only_for_pending_comp_slots_outside_a_code_led_round() {
+        let dir = temp_project("expected");
+        let cwd = dir.to_string_lossy().into_owned();
         let with = json!({ "options": [{ "id": "a", "comp": "m/a.png" }] });
-        assert!(comps_expected(&with));
+        assert!(comps_expected(&with, &cwd));
         let comp_led = json!({ "options": [{ "id": "a", "comp": "m/a.png" }], "buildPath": { "value": "comp", "toggle": true } });
-        assert!(comps_expected(&comp_led));
+        assert!(comps_expected(&comp_led, &cwd));
         let code_led = json!({ "options": [{ "id": "a", "comp": "m/a.png" }], "buildPath": { "value": "code", "toggle": true } });
-        assert!(!comps_expected(&code_led));
+        assert!(!comps_expected(&code_led, &cwd));
         let wireframes = json!({ "options": [{ "id": "a", "wireframe": { "cols": 12 } }] });
-        assert!(!comps_expected(&wireframes));
+        assert!(!comps_expected(&wireframes, &cwd));
         let urls_only = json!({ "options": [{ "id": "a", "comp": "https://x/a.png" }] });
-        assert!(!comps_expected(&urls_only));
+        assert!(!comps_expected(&urls_only, &cwd));
+        // The comp round serves comps that already exist: nothing is left to prompt.
+        std::fs::write(dir.join(".impeccable/mocks/comp-a.png"), b"png").unwrap();
+        std::fs::write(dir.join(".impeccable/mocks/comp-b.png"), b"png").unwrap();
+        let comp_round = json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/comp-a.png" }, { "id": "b", "comp": ".impeccable/mocks/comp-b.png" }] });
+        assert!(!comps_expected(&comp_round, &cwd));
+        // One slot still empty is enough.
+        let partial = json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/comp-a.png" }, { "id": "c", "comp": ".impeccable/mocks/comp-c.png" }] });
+        assert!(comps_expected(&partial, &cwd));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn comp_round_comps_sit_directly_in_mocks() {
+        assert!(is_comp_round_comp(".impeccable/mocks/comp-b-open-book.png"));
+        assert!(is_comp_round_comp("./.impeccable/mocks/comp-b.png"));
+        assert!(is_comp_round_comp("/abs/proj/.impeccable/mocks/comp-b.png"));
+        assert!(!is_comp_round_comp(".impeccable/mocks/decision/a.png"));
+        assert!(!is_comp_round_comp("https://x/a.png"));
+        assert!(!is_comp_round_comp("elsewhere/a.png"));
+    }
+
+    fn answer_lines(raw: &str) -> String {
+        let (mut io, cap) = Io::captured("", std::env::temp_dir(), Env::new());
+        print_answer(&mut io, raw);
+        let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+        out
+    }
+
+    #[test]
+    fn comp_round_pick_is_the_approved_comp_not_option_one() {
+        let out = answer_lines(r#"{"optionId":"b","steer":"","comp":".impeccable/mocks/comp-b-open-book.png"}"#);
+        assert!(out.contains("APPROVED COMP: the user picked this composition in the comp round"), "{out}");
+        assert!(out.contains("\"approved\": true"), "{out}");
+        assert!(!out.contains("CHOSEN COMP") && !out.contains("option one") && !out.contains("two variations"), "{out}");
+
+        let out = answer_lines(r#"{"optionId":"a","steer":"","comp":".impeccable/mocks/decision/a.png"}"#);
+        assert!(out.contains("CHOSEN COMP: the decision comp at that path is compositional option one."), "{out}");
+        assert!(!out.contains("APPROVED COMP"), "{out}");
     }
 
     #[test]
@@ -1474,6 +1538,11 @@ mod tests {
         std::fs::write(dir.join("code.json"), json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/decision/a.png" }], "buildPath": { "value": "code", "toggle": true } }).to_string()).unwrap();
         let (_, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "code.json"]);
         assert!(!out.contains("NEXT"), "{out}");
+
+        // Every declared comp already on disk (a comp round): no NEXT line.
+        std::fs::write(dir.join(".impeccable/mocks/decision/a.png"), b"png").unwrap();
+        let (_, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "comp.json"]);
+        assert_eq!(out, "next round delivered; the page reloads itself\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1488,6 +1557,14 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("BUILD PATH FLIPPED: comp"), "{out}");
         assert!(lines[1].starts_with("NEXT read /skill/reference/visualize.md now"), "{out}");
+
+        // A flip whose recorded comps all landed owes no new prompt.
+        std::fs::write(dir.join(".impeccable/mocks/decision/a.png"), b"png").unwrap();
+        let state = json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/", "comps": [".impeccable/mocks/decision/a.png"] });
+        std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
+        std::fs::write(dir.join(".impeccable/questions/k1.flip.json"), r#"{"buildPath":"comp"}"#).unwrap();
+        let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
+        assert!(out.starts_with("BUILD PATH FLIPPED: comp") && !out.contains("NEXT"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
