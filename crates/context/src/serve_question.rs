@@ -163,13 +163,20 @@ fn declared_comps(payload: &Value) -> Vec<String> {
 }
 
 /// A round whose comps get generated now: it is not code-led (a code-led
-/// round's slots are a flip reserve) and at least one declared local comp
-/// slot is not on disk yet. The decision round serves first and generates
-/// after, so its slots are empty at `--start`; the comp round serves comps
-/// that already exist, so it never qualifies.
+/// round's slots are a flip reserve) and it either declares a decision slot
+/// (under `mocks/decision/`) or has a local comp slot not on disk yet. A
+/// decision round always writes its comps after serving, and a re-roll often
+/// reuses the same slot paths, so a file left by the previous hand never
+/// counts as this hand's comp. The comp round serves comps that already exist
+/// directly in `mocks/`, so it never qualifies.
 fn comps_expected(payload: &Value, cwd: &str) -> bool {
     let code_led = payload.pointer("/buildPath/value").and_then(Value::as_str) == Some("code");
-    !code_led && any_comp_pending(cwd, &declared_comps(payload))
+    let comps = declared_comps(payload);
+    !code_led && (comps.iter().any(|c| is_decision_slot(c)) || any_comp_pending(cwd, &comps))
+}
+
+fn is_decision_slot(path: &str) -> bool {
+    path.replace('\\', "/").contains("mocks/decision/")
 }
 
 fn any_comp_pending(cwd: &str, comps: &[String]) -> bool {
@@ -1451,6 +1458,11 @@ mod tests {
         // One slot still empty is enough.
         let partial = json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/comp-a.png" }, { "id": "c", "comp": ".impeccable/mocks/comp-c.png" }] });
         assert!(comps_expected(&partial, &cwd));
+        // A re-roll reusing the previous hand's decision slots still owes new comps.
+        std::fs::create_dir_all(dir.join(".impeccable/mocks/decision")).unwrap();
+        std::fs::write(dir.join(".impeccable/mocks/decision/assigned.webp"), b"webp").unwrap();
+        let reroll = json!({ "options": [{ "id": "assigned", "comp": ".impeccable/mocks/decision/assigned.webp" }] });
+        assert!(comps_expected(&reroll, &cwd));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1543,9 +1555,15 @@ mod tests {
         let (_, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "code.json"]);
         assert!(!out.contains("NEXT"), "{out}");
 
-        // Every declared comp already on disk (a comp round): no NEXT line.
+        // A re-roll into the same decision slot still owes a new comp.
         std::fs::write(dir.join(".impeccable/mocks/decision/a.png"), b"png").unwrap();
         let (_, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "comp.json"]);
+        assert!(out.contains("NEXT read "), "{out}");
+
+        // A comp round serves comps already on disk directly in mocks/: no NEXT line.
+        std::fs::write(dir.join(".impeccable/mocks/comp-a.png"), b"png").unwrap();
+        std::fs::write(dir.join("round.json"), json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/comp-a.png" }] }).to_string()).unwrap();
+        let (_, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "round.json"]);
         assert_eq!(out, "next round delivered; the page reloads itself\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
