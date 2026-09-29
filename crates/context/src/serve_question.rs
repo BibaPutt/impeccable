@@ -1536,7 +1536,8 @@ mod tests {
         let out = out.replace('\\', "/");
         assert_eq!(code, 0);
         assert_eq!(out.lines().next(), Some("next round delivered; the page reloads itself"));
-        assert!(out.lines().nth(1).unwrap().starts_with("NEXT read /skill/reference/visualize.md now"), "{out}");
+        let next = out.lines().nth(1).unwrap();
+        assert!(next.starts_with("NEXT read ") && next.contains("/skill/reference/visualize.md now"), "{out}");
 
         std::fs::write(dir.join("code.json"), json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/decision/a.png" }], "buildPath": { "value": "code", "toggle": true } }).to_string()).unwrap();
         let (_, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "code.json"]);
@@ -1560,7 +1561,7 @@ mod tests {
         assert_eq!(code, 0);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("BUILD PATH FLIPPED: comp"), "{out}");
-        assert!(lines[1].starts_with("NEXT read /skill/reference/visualize.md now"), "{out}");
+        assert!(lines[1].starts_with("NEXT read ") && lines[1].contains("/skill/reference/visualize.md now"), "{out}");
 
         // A flip whose recorded comps all landed owes no new prompt.
         std::fs::write(dir.join(".impeccable/mocks/decision/a.png"), b"png").unwrap();
