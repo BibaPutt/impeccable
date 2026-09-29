@@ -1486,7 +1486,7 @@ mod tests {
     #[test]
     fn visualize_next_line_names_the_skill_reference() {
         let env = Env::from([("IMPECCABLE_SKILL_DIR".into(), "/skill".into())]);
-        let line = visualize_next_line(&env, "/proj");
+        let line = visualize_next_line(&env, "/proj").replace('\\', "/");
         assert!(line.starts_with("NEXT read /skill/reference/visualize.md now, before writing any decision comp prompt;"), "{line}");
         assert!(line.ends_with("(<comp>.json).\n"));
     }
@@ -1503,6 +1503,7 @@ mod tests {
         std::fs::write(dir.join(format!("{}.json", comps[1])), r#"{"prompt":"p"}"#).unwrap();
 
         let (code, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
+        let out = out.replace('\\', "/");
         assert_eq!(code, 3);
         assert!(out.starts_with("WAITING: "), "{out}");
         assert!(out.contains("COMP SIDECAR MISSING: .impeccable/mocks/decision/a.png landed with no prompt sidecar."), "{out}");
@@ -1511,6 +1512,7 @@ mod tests {
 
         std::fs::write(dir.join(".impeccable/questions/k1.answer.json"), r#"{"optionId":"a","comp":".impeccable/mocks/decision/a.png"}"#).unwrap();
         let (code, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
+        let out = out.replace('\\', "/");
         assert_eq!(code, 0);
         let answer_at = out.find("ANSWER: ").unwrap();
         let missing_at = out.find("COMP SIDECAR MISSING: .impeccable/mocks/decision/a.png").unwrap();
@@ -1531,6 +1533,7 @@ mod tests {
         std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
         std::fs::write(dir.join("comp.json"), json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/decision/a.png" }] }).to_string()).unwrap();
         let (code, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "comp.json"]);
+        let out = out.replace('\\', "/");
         assert_eq!(code, 0);
         assert_eq!(out.lines().next(), Some("next round delivered; the page reloads itself"));
         assert!(out.lines().nth(1).unwrap().starts_with("NEXT read /skill/reference/visualize.md now"), "{out}");
@@ -1553,6 +1556,7 @@ mod tests {
         std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
         std::fs::write(dir.join(".impeccable/questions/k1.flip.json"), r#"{"buildPath":"comp"}"#).unwrap();
         let (code, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
+        let out = out.replace('\\', "/");
         assert_eq!(code, 0);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("BUILD PATH FLIPPED: comp"), "{out}");
