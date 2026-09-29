@@ -130,6 +130,72 @@ fn print_answer(io: &mut Io, raw: &str) {
     }
 }
 
+/// Local comp paths a round declares, in card order: every option's `comp`
+/// (or the legacy `sketch`) and the canon card's, as written in the payload.
+/// URLs are left out: they are rendered already, never generated here.
+fn declared_comps(payload: &Value) -> Vec<String> {
+    let mut cards: Vec<&Value> = payload.get("options").and_then(Value::as_array).map(|o| o.iter().collect()).unwrap_or_default();
+    if let Some(c) = payload.get("canonCard").filter(|c| c.is_object()) {
+        cards.push(c);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for card in cards {
+        let comp = card.get("comp").filter(|v| !v.is_null()).or_else(|| card.get("sketch").filter(|v| !v.is_null()));
+        let Some(s) = comp.filter(|v| crate::staleness::js_truthy(v)).map(js_str) else { continue };
+        if s.starts_with("http://") || s.starts_with("https://") || out.contains(&s) {
+            continue;
+        }
+        out.push(s);
+    }
+    out
+}
+
+/// A round whose comps get generated now: it declares local comp slots and
+/// is not code-led (a code-led round's slots are a flip reserve).
+fn comps_expected(payload: &Value) -> bool {
+    let code_led = payload.pointer("/buildPath/value").and_then(Value::as_str) == Some("code");
+    !code_led && !declared_comps(payload).is_empty()
+}
+
+fn visualize_ref(env: &Env, cwd: &str) -> String {
+    crate::provider::detect(env, cwd).reference_path("visualize").unwrap_or_else(|| "reference/visualize.md".to_string())
+}
+
+/// The directive that puts visualize.md in front of the agent at the moment
+/// the decision round's comps are about to be written.
+fn visualize_next_line(env: &Env, cwd: &str) -> String {
+    format!(
+        "NEXT read {} now, before writing any decision comp prompt; its comp rules govern every card's image. Then generate each declared comp into its slot, lead first, and record the exact prompt in its sidecar (<comp>.json).\n",
+        visualize_ref(env, cwd)
+    )
+}
+
+/// Declared comps that landed on disk without a `<comp>.json` prompt sidecar.
+fn comps_missing_sidecar(cwd: &str, comps: &[String]) -> Vec<String> {
+    comps
+        .iter()
+        .filter(|c| {
+            let abs = jsp::resolve(cwd, &[c.as_str()]);
+            exists(&abs) && !exists(&format!("{}.json", abs))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The `--wait` backstop: names every landed decision comp with no sidecar.
+fn sidecar_missing_line(env: &Env, cwd: &str, missing: &[String]) -> String {
+    format!(
+        "COMP SIDECAR MISSING: {} landed with no prompt sidecar. Every decision comp records the exact prompt that produced it in <comp>.json ({{\"prompt\": \"...\"}}; generate-image writes it itself, a harness image tool does not), and that prompt is written under the comp rules in {}. Write each missing sidecar now, and read that file before the next comp prompt if you have not.\n",
+        missing.join(", "),
+        visualize_ref(env, cwd)
+    )
+}
+
+/// The comps recorded for the live round in `<key>.state.json`.
+fn state_comps(state: &Map<String, Value>) -> Vec<String> {
+    state.get("comps").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default()
+}
+
 fn js_str(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -227,6 +293,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             if exists(&flip_file(&qdir, &key)) {
                 let _ = std::fs::remove_file(flip_file(&qdir, &key));
                 io.out("BUILD PATH FLIPPED: comp (for this session only; never write it to settings). The table is still open and the page shows shimmer where the images will land: generate each open card’s comp into its declared path now, lead first, then collect the answer with --wait again. A card whose comp already exists needs nothing.\n");
+                io.out(&visualize_next_line(&env, &cwd));
                 return 0;
             }
             if !is_alive(&qdir, &key) {
@@ -251,13 +318,21 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             io.out("PAGE CLOSED: the question page went away without an answer; re-present, reopen the URL, or fall back to the structured question tool\n");
             return 4;
         }
+        // Read before the answer path may delete the state file.
+        let missing = read_state(&qdir, &key).map(|s| comps_missing_sidecar(&cwd, &state_comps(&s))).unwrap_or_default();
         if !answered() {
             io.out(&format!("WAITING: no answer yet after {}s; run --wait --key {} again\n", crate::util::js_number_to_string(poll_sec), key));
+            if !missing.is_empty() {
+                io.out(&sidecar_missing_line(&env, &cwd, &missing));
+            }
             return 3;
         }
         let collected = safe_read(&answer_file(&qdir, &key)).unwrap_or_default();
         let collected = crate::util::js_trim(&collected).to_string();
         print_answer(io, &collected);
+        if !missing.is_empty() {
+            io.out(&sidecar_missing_line(&env, &cwd, &missing));
+        }
         let mut keeps_open = false;
         if let Ok(p) = serde_json::from_str::<Value>(&collected) {
             keeps_open = p.get("optionId").and_then(|v| v.as_str()) == Some("reroll") || p.get("followup") == Some(&Value::Bool(true));
@@ -311,6 +386,9 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         let _ = std::fs::copy(jsp::resolve(&cwd, &[&pp]), &delivered);
         touch_now(&delivered);
         io.out("next round delivered; the page reloads itself\n");
+        if comps_expected(&next_round) {
+            io.out(&visualize_next_line(&env, &cwd));
+        }
         return 0;
     }
 
@@ -319,10 +397,13 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             io.err("serve-question: --start needs --payload <file>\n");
             return 1;
         };
-        if let Err(msg) = read_json_file(&jsp::resolve(&cwd, &[&pp])) {
-            io.err(&format!("{}\n", msg));
-            return 1;
-        }
+        let start_payload = match read_json_file(&jsp::resolve(&cwd, &[&pp])) {
+            Ok(v) => v,
+            Err(msg) => {
+                io.err(&format!("{}\n", msg));
+                return 1;
+            }
+        };
         let _ = std::fs::create_dir_all(&qdir);
         let key = a.arg("key").unwrap_or_else(random_key);
         let log_file = jsp::join(&[&qdir, &format!("{}.log", key)]);
@@ -386,6 +467,9 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         io.out(&format!("QUESTION URL: {}\n", state.get("url").map(js_str).unwrap_or_default()));
         io.out(&format!("QUESTION KEY: {}\n", key));
         io.out("Open the URL for the user now: in-app browser when the harness has one, otherwise the system opener (macOS `open`, Linux `xdg-open`), otherwise show the URL.\n");
+        if comps_expected(&start_payload) {
+            io.out(&visualize_next_line(&env, &cwd));
+        }
         io.out(&format!("Then collect the answer with: {} --wait --key {}\n", crate::provider::detect(&env, &cwd).verb_cmd("serve-question"), key));
         return 0;
     }
@@ -423,7 +507,11 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
     if a.has("detached-serve") {
         let _ = std::fs::create_dir_all(&qdir);
         let key = a.arg("key").unwrap_or_default();
-        let st = json!({ "pid": std::process::id(), "port": actual_port, "url": url });
+        let mut st = json!({ "pid": std::process::id(), "port": actual_port, "url": url });
+        let comps = declared_comps(&state.lock().unwrap().payload);
+        if !comps.is_empty() {
+            st["comps"] = json!(comps);
+        }
         let _ = std::fs::write(state_file(&qdir, &key), json_compact(&st));
     } else {
         io.out(&format!("QUESTION URL: {}\n", url));
@@ -495,6 +583,12 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                     if let Some(k) = st.detached_key.clone() {
                         if let Some(mut s) = read_state(&st.qdir, &k) {
                             s.insert("claimedAt".into(), Value::from(st.last_claim_at as i64));
+                            let comps = declared_comps(&st.payload);
+                            if comps.is_empty() {
+                                s.remove("comps");
+                            } else {
+                                s.insert("comps".into(), json!(comps));
+                            }
                             let _ = std::fs::write(state_file(&st.qdir, &k), json_compact(&Value::Object(s)));
                         }
                     }
@@ -1274,6 +1368,127 @@ mod tests {
         assert!(PAGE.contains("aria-label=\"Impeccable\""));
         assert!(PAGE.contains("color-scheme: light"));
         assert!(!PAGE.contains("color-scheme: dark"));
+    }
+
+    fn temp_project(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("impeccable-sq-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".impeccable/questions")).unwrap();
+        std::fs::create_dir_all(dir.join(".impeccable/mocks/decision")).unwrap();
+        dir
+    }
+
+    fn run_captured(dir: &std::path::Path, args: &[&str]) -> (i32, String) {
+        let env = Env::from([("IMPECCABLE_SKILL_DIR".into(), "/skill".into())]);
+        let (mut io, cap) = Io::captured("", dir.to_path_buf(), env);
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let code = run(&argv, &mut io);
+        let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+        (code, out)
+    }
+
+    #[test]
+    fn declared_comps_reads_options_sketch_alias_and_canon_in_card_order() {
+        let payload = json!({
+            "options": [
+                { "id": "a", "comp": ".impeccable/mocks/decision/a.png" },
+                { "id": "b", "sketch": ".impeccable/mocks/decision/b.png" },
+                { "id": "c", "comp": "https://x/c.png" },
+                { "id": "d" },
+                { "id": "e", "comp": ".impeccable/mocks/decision/a.png" }
+            ],
+            "canonCard": { "label": "canon", "comp": ".impeccable/mocks/decision/canon.png" }
+        });
+        assert_eq!(
+            declared_comps(&payload),
+            vec![".impeccable/mocks/decision/a.png", ".impeccable/mocks/decision/b.png", ".impeccable/mocks/decision/canon.png"]
+        );
+    }
+
+    #[test]
+    fn comps_expected_only_for_comp_slots_outside_a_code_led_round() {
+        let with = json!({ "options": [{ "id": "a", "comp": "m/a.png" }] });
+        assert!(comps_expected(&with));
+        let comp_led = json!({ "options": [{ "id": "a", "comp": "m/a.png" }], "buildPath": { "value": "comp", "toggle": true } });
+        assert!(comps_expected(&comp_led));
+        let code_led = json!({ "options": [{ "id": "a", "comp": "m/a.png" }], "buildPath": { "value": "code", "toggle": true } });
+        assert!(!comps_expected(&code_led));
+        let wireframes = json!({ "options": [{ "id": "a", "wireframe": { "cols": 12 } }] });
+        assert!(!comps_expected(&wireframes));
+        let urls_only = json!({ "options": [{ "id": "a", "comp": "https://x/a.png" }] });
+        assert!(!comps_expected(&urls_only));
+    }
+
+    #[test]
+    fn visualize_next_line_names_the_skill_reference() {
+        let env = Env::from([("IMPECCABLE_SKILL_DIR".into(), "/skill".into())]);
+        let line = visualize_next_line(&env, "/proj");
+        assert!(line.starts_with("NEXT read /skill/reference/visualize.md now, before writing any decision comp prompt;"), "{line}");
+        assert!(line.ends_with("(<comp>.json).\n"));
+    }
+
+    #[test]
+    fn wait_names_landed_comps_without_a_prompt_sidecar() {
+        let dir = temp_project("wait-sidecar");
+        let comps = [".impeccable/mocks/decision/a.png", ".impeccable/mocks/decision/b.png", ".impeccable/mocks/decision/c.png"];
+        let state = json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/", "comps": comps });
+        std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
+        // a landed without a sidecar, b landed with one, c has not landed yet.
+        std::fs::write(dir.join(comps[0]), b"png").unwrap();
+        std::fs::write(dir.join(comps[1]), b"png").unwrap();
+        std::fs::write(dir.join(format!("{}.json", comps[1])), r#"{"prompt":"p"}"#).unwrap();
+
+        let (code, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
+        assert_eq!(code, 3);
+        assert!(out.starts_with("WAITING: "), "{out}");
+        assert!(out.contains("COMP SIDECAR MISSING: .impeccable/mocks/decision/a.png landed with no prompt sidecar."), "{out}");
+        assert!(out.contains("/skill/reference/visualize.md"), "{out}");
+        assert!(!out.contains("decision/b.png") && !out.contains("decision/c.png"), "{out}");
+
+        std::fs::write(dir.join(".impeccable/questions/k1.answer.json"), r#"{"optionId":"a","comp":".impeccable/mocks/decision/a.png"}"#).unwrap();
+        let (code, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
+        assert_eq!(code, 0);
+        let answer_at = out.find("ANSWER: ").unwrap();
+        let missing_at = out.find("COMP SIDECAR MISSING: .impeccable/mocks/decision/a.png").unwrap();
+        assert!(answer_at < missing_at, "{out}");
+
+        // Once every landed comp has its sidecar, the backstop stays quiet.
+        std::fs::write(dir.join(format!("{}.json", comps[0])), r#"{"prompt":"p"}"#).unwrap();
+        std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
+        let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
+        assert!(!out.contains("COMP SIDECAR MISSING"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_prints_the_visualize_directive_only_when_comps_are_due() {
+        let dir = temp_project("update-next");
+        let state = json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/" });
+        std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
+        std::fs::write(dir.join("comp.json"), json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/decision/a.png" }] }).to_string()).unwrap();
+        let (code, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "comp.json"]);
+        assert_eq!(code, 0);
+        assert_eq!(out.lines().next(), Some("next round delivered; the page reloads itself"));
+        assert!(out.lines().nth(1).unwrap().starts_with("NEXT read /skill/reference/visualize.md now"), "{out}");
+
+        std::fs::write(dir.join("code.json"), json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/decision/a.png" }], "buildPath": { "value": "code", "toggle": true } }).to_string()).unwrap();
+        let (_, out) = run_captured(&dir, &["--update", "--key", "k1", "--payload", "code.json"]);
+        assert!(!out.contains("NEXT"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flip_to_comp_puts_visualize_in_front_of_the_comps() {
+        let dir = temp_project("flip-next");
+        let state = json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/" });
+        std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
+        std::fs::write(dir.join(".impeccable/questions/k1.flip.json"), r#"{"buildPath":"comp"}"#).unwrap();
+        let (code, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
+        assert_eq!(code, 0);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("BUILD PATH FLIPPED: comp"), "{out}");
+        assert!(lines[1].starts_with("NEXT read /skill/reference/visualize.md now"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // JS scenarios: tests/serve-question.test.mjs (public repo main,
