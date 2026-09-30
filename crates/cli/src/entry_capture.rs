@@ -4,26 +4,25 @@ use crate::{
     capture_snapshot::{HtmlSnapshot, SnapshotSelection},
     component_capture::render_page,
 };
-use impeccable_browser::{
-    cdp::Browser,
-    discovery,
-    html_snapshot::{HtmlSnapshot as PageSnapshot, SnapshotSelection as PageSelection},
-};
+use impeccable_browser::{cdp::Browser, discovery, html_snapshot::HtmlSnapshot as PageSnapshot};
+use impeccable_comp_verbs::asset_capture::capture_sha256;
 use impeccable_comp_verbs::entry_capture::{
     CapturedEntry, EntryEvidence, EntryRenderer, EntryRequest, EntryStage, FrameEvidence,
 };
 use serde_json::{Value, json};
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 pub struct CdpEntryRenderer;
-/// The frozen inputs a capture was drawn from. Raster entries keep the asset
-/// adapter's snapshot; text-only entries keep the assembled-page snapshot.
-enum Frozen {
-    Raster(Arc<HtmlSnapshot>),
-    Page(Arc<PageSnapshot>),
-}
+/// The frozen inputs a capture was drawn from. A text-only capture also binds
+/// the hero review manifest whose dependency list chose what the page may load.
 struct FrozenEntry {
-    snapshot: Frozen,
+    snapshot: Arc<HtmlSnapshot>,
+    manifest: Option<(PathBuf, Vec<u8>)>,
     evidence: EntryEvidence,
 }
 impl CapturedEntry for FrozenEntry {
@@ -31,20 +30,34 @@ impl CapturedEntry for FrozenEntry {
         &self.evidence
     }
     fn verify_current(&self) -> Result<(), String> {
-        match &self.snapshot {
-            Frozen::Raster(s) => s.verify_current(),
-            Frozen::Page(s) => s.verify_current(),
+        self.snapshot.verify_current()?;
+        if let Some((path, bytes)) = &self.manifest {
+            if fs::read(path).ok().as_ref() != Some(bytes) {
+                return Err("capture input changed: .impeccable/review/hero.json".into());
+            }
         }
+        Ok(())
     }
 }
 impl EntryRenderer for CdpEntryRenderer {
     fn capture_entry(&self, request: &EntryRequest) -> Result<Box<dyn CapturedEntry>, String> {
+        self.capture_forbidding(request, &[])
+    }
+}
+impl CdpEntryRenderer {
+    /// `forbidden` holds approved images (a reviewed screenshot) that a text-only
+    /// page must not load or embed; the bound comp is always forbidden there.
+    pub fn capture_forbidding(
+        &self,
+        request: &EntryRequest,
+        forbidden: &[&[u8]],
+    ) -> Result<Box<dyn CapturedEntry>, String> {
         // The shared gate chooses the entry/spec/reference, never a caller URL.
         let served = static_inventory(&request.root)?;
         let snapshot = Arc::new(HtmlSnapshot::freeze(SnapshotSelection {
             root: request.root.clone(),
             entry: request.artifact.clone(),
-            served,
+            served: served.clone(),
             bound: vec![request.spec.clone(), request.reference.clone()],
         })?);
         let spec: Value =
@@ -83,7 +96,7 @@ impl EntryRenderer for CdpEntryRenderer {
             ],
         };
         if ids.is_empty() {
-            return capture_text_only(request, &snapshot, &frames);
+            return capture_text_only(request, snapshot, &served, &frames, forbidden);
         }
         let mut evidence = EntryEvidence {
             report: json!({"schema":"native-entry-capture-v1","inputSnapshot":snapshot.digest(),"manifest":snapshot.manifest(),"artifact":request.artifact,"stage":match request.stage {EntryStage::Hero=>"hero",EntryStage::Responsive=>"responsive"},"scope":"Fresh static HTML rendering and scoped raster evidence. No independent aesthetic approval."}),
@@ -145,7 +158,8 @@ impl EntryRenderer for CdpEntryRenderer {
         }
         snapshot.verify_current()?;
         Ok(Box::new(FrozenEntry {
-            snapshot: Frozen::Raster(snapshot),
+            snapshot,
+            manifest: None,
             evidence,
         }))
     }
@@ -158,10 +172,18 @@ impl EntryRenderer for CdpEntryRenderer {
 /// double-screenshot stability), so an approved review screenshot and the gate's
 /// frame come from one capture method. Frames carry no region receipts: there is
 /// no rendered-presence check to run without artwork.
+///
+/// The page is served what the review serves: the entry plus the dependencies the
+/// hero review manifest declares for it, or, before any review names this entry,
+/// the static inventory. Either way the bound spec and comp are never served, and
+/// a page that loads or embeds the comp (or an approved screenshot) is refused,
+/// so the comparison cannot be satisfied by showing the reference itself.
 fn capture_text_only(
     request: &EntryRequest,
-    raster: &HtmlSnapshot,
+    raster: Arc<HtmlSnapshot>,
+    inventory: &[String],
     frames: &[(&str, Option<[u32; 2]>)],
+    forbidden: &[&[u8]],
 ) -> Result<Box<dyn CapturedEntry>, String> {
     let spec: Value = serde_json::from_slice(raster.bytes(&request.spec).ok_or("missing bound spec")?)
         .map_err(|e| e.to_string())?;
@@ -173,24 +195,45 @@ fn capture_text_only(
             .ok_or_else(|| format!("missing reference {k}"))
     };
     let (width, height) = (size("width")?, size("height")?);
-    let page = Arc::new(PageSnapshot::freeze(PageSelection {
-        root: request.root.clone(),
-        entry: request.artifact.clone(),
-        served: static_inventory(&request.root)?,
-        bound: vec![request.spec.clone(), request.reference.clone()],
-    })?);
-    // Both snapshots hash the same manifest schema: equal digests mean the page
-    // was drawn from the very inputs the spec and reference checks just read.
-    if page.digest() != raster.digest() {
-        return Err("capture input changed: text-only snapshot differs from the bound inputs".into());
+    let comp = raster.bytes(&request.reference).ok_or("reference is not bound to snapshot")?;
+    let mut forbidden: Vec<&[u8]> = forbidden.to_vec();
+    forbidden.push(comp);
+    let (declared, manifest) = declared_dependencies(&request.root, &request.artifact)?;
+    let policy = if declared.is_some() { "hero-review-manifest" } else { "static-inventory" };
+    let names: Vec<String> = match &declared {
+        Some(deps) => {
+            let mut names = vec![request.artifact.clone()];
+            for dep in deps {
+                if !inventory.contains(dep) {
+                    return Err(format!("hero review dependency {dep} is not a static browser file in the project (hidden, package or source-only paths are never served)"));
+                }
+                names.push(dep.clone());
+            }
+            names
+        }
+        None => inventory.to_vec(),
+    };
+    // Reuse the bytes the first snapshot froze; nothing is read from disk twice.
+    let mut files = BTreeMap::new();
+    for name in names {
+        if name == request.spec || name == request.reference {
+            continue;
+        }
+        let bytes = raster.bytes(&name).ok_or_else(|| format!("{name} is not in the frozen inputs"))?;
+        if let Some(reason) = forbidden_content(&name, bytes, &forbidden) {
+            return Err(format!("text-only first viewport serves {name}, which {reason}. The page must draw the first viewport in code, not show the approved reference."));
+        }
+        files.insert(name, bytes.to_vec());
     }
+    let page = Arc::new(PageSnapshot::from_pinned(request.artifact.clone(), files)?);
+    let forbidden_hashes: Vec<String> = forbidden.iter().map(|b| capture_sha256(b)).collect();
     let env = impeccable_common::process_env();
     let exe = discovery::find_browser(&env).map_err(|e| format!("browser unavailable: {e:?}"))?;
     let mut browser = Browser::launch(&exe, &[], false).map_err(|e| e.message)?;
     let result = (|| -> Result<EntryEvidence, String> {
         let browser_version = browser.version().map_err(|e| e.message)?;
         let mut evidence = EntryEvidence {
-            report: json!({"schema":"native-entry-capture-v1","inputSnapshot":page.digest(),"manifest":page.manifest(),"artifact":request.artifact,"stage":match request.stage {EntryStage::Hero=>"hero",EntryStage::Responsive=>"responsive"},"scope":"Fresh static HTML rendering of a first viewport with no raster region. No independent aesthetic approval.","captureMethod":"assembled-page-viewport","browser":browser_version,"frameProofs":{}}),
+            report: json!({"schema":"native-entry-capture-v1","inputSnapshot":raster.digest(),"manifest":raster.manifest(),"artifact":request.artifact,"stage":match request.stage {EntryStage::Hero=>"hero",EntryStage::Responsive=>"responsive"},"scope":"Fresh static HTML rendering of a first viewport with no raster region. No independent aesthetic approval.","captureMethod":"assembled-page-viewport","integrityScope":"assembled-page viewport from frozen inputs; the comp and approved screenshots are never served; no raster presence check (no raster region)","dependencyPolicy":policy,"servedToPage":page.manifest()["files"],"browser":browser_version,"frameProofs":{}}),
             frames: vec![],
         };
         for &(name, viewport) in frames {
@@ -205,7 +248,20 @@ fn capture_text_only(
                 true,
                 true,
             )
-            .map_err(|e| format!("{name} text-only capture failed: {e}"))?;
+            .map_err(|e| {
+                // Both the network check and the image-decode check name the path
+                // the page asked for; the comp is never served, so either fires.
+                let asked = format!("/{}", request.reference);
+                if e.split(|c: char| c.is_whitespace() || c == ',').any(|t| t.trim_end_matches('.') == asked) {
+                    format!("{name} text-only capture refused: the page loads the approved comp ({}). Draw the first viewport in code.", request.reference)
+                } else {
+                    format!("{name} text-only capture failed: {e}")
+                }
+            })?;
+            let loaded = proof["observedDependencies"].as_object().into_iter().flatten();
+            if let Some((path, _)) = loaded.into_iter().find(|(_, h)| forbidden_hashes.iter().any(|f| h.as_str() == Some(f))) {
+                return Err(format!("{name} text-only capture refused: the page loads {path}, a copy of the approved reference. Draw the first viewport in code."));
+            }
             evidence.report["frameProofs"][name] = proof;
             evidence.frames.push(FrameEvidence {
                 name: name.into(),
@@ -216,12 +272,69 @@ fn capture_text_only(
         Ok(evidence)
     })();
     browser.close();
-    let evidence = result?;
-    page.verify_current()?;
-    Ok(Box::new(FrozenEntry {
-        snapshot: Frozen::Page(page),
-        evidence,
-    }))
+    let mut evidence = result?;
+    if let Some((_, bytes)) = &manifest {
+        evidence.report["reviewManifestSha256"] = json!(capture_sha256(bytes));
+    }
+    let entry = FrozenEntry { snapshot: raster, manifest, evidence };
+    entry.verify_current()?;
+    Ok(Box::new(entry))
+}
+
+/// The dependency list the hero review manifest declares for this entry, when it
+/// names one: the same closure the assembled-page review pins and serves.
+fn declared_dependencies(
+    root: &Path,
+    artifact: &str,
+) -> Result<(Option<Vec<String>>, Option<(PathBuf, Vec<u8>)>), String> {
+    let path = root.join(".impeccable").join("review").join("hero.json");
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok((None, None));
+    };
+    let Ok(manifest) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok((None, None));
+    };
+    let pages: Vec<&Value> = manifest["components"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["preview"]["kind"] == "page" && c["preview"]["path"] == artifact)
+        .collect();
+    if manifest["stage"] != "hero" || pages.len() != 1 {
+        return Ok((None, None));
+    }
+    let deps = pages[0]["dependencies"]
+        .as_array()
+        .ok_or("hero review manifest: the page component has no dependencies list")?
+        .iter()
+        .map(|d| d.as_str().map(|s| s.replace('\\', "/")).ok_or("hero review manifest: dependencies must be paths"))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((Some(deps), Some((path, bytes))))
+}
+
+/// Whether a served file is, or inlines as base64, one of the forbidden images.
+fn forbidden_content(name: &str, bytes: &[u8], forbidden: &[&[u8]]) -> Option<&'static str> {
+    use base64::Engine;
+    let text = matches!(
+        Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase).as_deref(),
+        Some("html" | "htm" | "css" | "js" | "mjs" | "svg")
+    )
+    .then(|| String::from_utf8_lossy(bytes));
+    for image in forbidden {
+        if bytes == *image {
+            return Some("is a copy of the approved reference");
+        }
+        // A data URI of the image carries its base64 from the first byte, so a
+        // leading run of it identifies the embed (line breaks aside).
+        if let Some(text) = &text {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(image);
+            let probe = &encoded[..encoded.len().min(512)];
+            if probe.len() >= 64 && text.contains(probe) {
+                return Some("embeds the approved reference as a data URI");
+            }
+        }
+    }
+    None
 }
 
 /// Enumerate only static browser files. Never serve hidden state, source-only

@@ -227,3 +227,90 @@ fn reviewed_renderer_binds_an_approved_text_only_viewport() {
     assert_eq!((a.width, a.height, &a.data), (b.width, b.height, &b.data));
     captured.verify_current().unwrap();
 }
+
+fn refusal(f: &Fixture) -> String {
+    match CdpEntryRenderer.capture_entry(&f.request(EntryStage::Hero)) {
+        Ok(_) => panic!("capture should be refused"),
+        Err(e) => e,
+    }
+}
+
+#[test]
+fn text_only_page_cannot_show_the_comp_instead_of_drawing_it() {
+    if !browser_available() {
+        return;
+    }
+    let f = Fixture::new();
+    let comp = fs::read(f.project.join("comp.png")).unwrap();
+    // The bound comp is never served: an <img> of it is refused, not matched.
+    fs::write(f.project.join("index.html"), "<!doctype html><style>body{margin:0}</style><img src=\"comp.png\" style=\"display:block\">").unwrap();
+    let e = refusal(&f);
+    assert!(e.contains("loads the approved comp"), "{e}");
+    // A byte copy at another path is refused before the browser opens.
+    fs::create_dir_all(f.project.join("assets")).unwrap();
+    fs::write(f.project.join("assets/copy.png"), &comp).unwrap();
+    fs::write(f.project.join("index.html"), "<!doctype html><img src=\"assets/copy.png\">").unwrap();
+    let e = refusal(&f);
+    assert!(e.contains("assets/copy.png") && e.contains("copy of the approved reference"), "{e}");
+    fs::remove_file(f.project.join("assets/copy.png")).unwrap();
+    // So is the comp inlined as a data URI.
+    use base64::Engine;
+    let uri = base64::engine::general_purpose::STANDARD.encode(&comp);
+    fs::write(f.project.join("index.html"), format!("<!doctype html><img src=\"data:image/png;base64,{uri}\">")).unwrap();
+    let e = refusal(&f);
+    assert!(e.contains("index.html") && e.contains("data URI"), "{e}");
+}
+
+#[test]
+fn text_only_page_cannot_show_the_approved_screenshot() {
+    if !browser_available() {
+        return;
+    }
+    let f = Fixture::new();
+    let hero = CdpEntryRenderer.capture_entry(&f.request(EntryStage::Hero)).unwrap().evidence().frames[0].png.clone();
+    f.approve(&hero);
+    fs::create_dir_all(f.project.join("assets")).unwrap();
+    fs::write(f.project.join("assets/shot.png"), &hero).unwrap();
+    fs::write(f.project.join("index.html"), "<!doctype html><style>body{margin:0}img{display:block}</style><img src=\"assets/shot.png\">").unwrap();
+    let renderer = ReviewedEntryRenderer::local(&f.project, Some(&f.home));
+    let e = match renderer.capture_entry(&f.request(EntryStage::Hero)) {
+        Ok(_) => panic!("a page showing the approved screenshot must be refused"),
+        Err(e) => e,
+    };
+    assert!(e.contains("assets/shot.png") && e.contains("approved reference"), "{e}");
+}
+
+#[test]
+fn text_only_page_is_served_the_hero_review_dependencies() {
+    if !browser_available() {
+        return;
+    }
+    let f = Fixture::new();
+    fs::write(f.project.join("style.css"), "h1{outline:0}").unwrap();
+    fs::write(f.project.join("extra.js"), "document.body.dataset.extra='1';").unwrap();
+    let manifest = |deps: &[&str]| {
+        json!({"schemaVersion":2,"stage":"hero","id":"hero","title":"Hero","comp":{"path":"comp.png","width":240,"height":160},
+            "components":[{"id":"page","name":"Page","box":{"x":0,"y":0,"w":1,"h":1},"preview":{"kind":"page","path":"index.html"},"dependencies":deps}]})
+    };
+    fs::write(f.project.join("index.html"), format!("{PAGE}<link rel=stylesheet href=\"style.css\"><script src=\"extra.js\"></script>")).unwrap();
+    // Before any review names the entry, the static inventory is served.
+    let captured = CdpEntryRenderer.capture_entry(&f.request(EntryStage::Hero)).unwrap();
+    assert_eq!(captured.evidence().report["dependencyPolicy"], "static-inventory");
+    // The review declared only the stylesheet: the script is undeclared, as in the review.
+    fs::write(f.project.join(".impeccable/review/hero.json"), serde_json::to_vec(&manifest(&["style.css"])).unwrap()).unwrap();
+    let e = refusal(&f);
+    assert!(e.contains("undeclared dependency: /extra.js"), "{e}");
+    // Declared, it loads; the manifest is bound to the capture.
+    fs::write(f.project.join(".impeccable/review/hero.json"), serde_json::to_vec(&manifest(&["style.css", "extra.js"])).unwrap()).unwrap();
+    let captured = CdpEntryRenderer.capture_entry(&f.request(EntryStage::Hero)).unwrap();
+    assert_eq!(captured.evidence().report["dependencyPolicy"], "hero-review-manifest");
+    let served: Vec<_> = captured.evidence().report["servedToPage"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
+    assert_eq!(served, ["extra.js", "index.html", "style.css"]);
+    captured.verify_current().unwrap();
+    fs::write(f.project.join(".impeccable/review/hero.json"), serde_json::to_vec(&manifest(&["style.css"])).unwrap()).unwrap();
+    assert!(captured.verify_current().is_err());
+    // A declared dependency outside the static inventory is never served.
+    fs::write(f.project.join(".impeccable/review/hero.json"), serde_json::to_vec(&manifest(&[".env"])).unwrap()).unwrap();
+    let e = refusal(&f);
+    assert!(e.contains(".env") && e.contains("never served"), "{e}");
+}

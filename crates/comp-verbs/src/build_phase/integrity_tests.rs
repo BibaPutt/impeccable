@@ -951,11 +951,11 @@ impl CapturedEntry for ReviewedCapture {
     fn verify_current(&self) -> Result<(), String> { Ok(()) }
 }
 /// Stands in for the reviewed native renderer: `approved` is what the user accepted.
-struct ReviewedRenderer { hero: Vec<u8>, approved: Option<Vec<u8>> }
+struct ReviewedRenderer { hero: Vec<u8>, approved: Option<Vec<u8>>, report: Value }
 impl EntryRenderer for ReviewedRenderer {
     fn capture_entry(&self, _: &EntryRequest) -> Result<Box<dyn CapturedEntry>, String> {
         let frame = crate::entry_capture::FrameEvidence { name: "hero".into(), png: self.hero.clone(), regions: vec![] };
-        Ok(Box::new(ReviewedCapture(crate::entry_capture::EntryEvidence { report: json!({}), frames: vec![frame] },
+        Ok(Box::new(ReviewedCapture(crate::entry_capture::EntryEvidence { report: self.report.clone(), frames: vec![frame] },
             self.approved.clone().map(|png| crate::entry_capture::ApprovedReference { png, proof: json!({"schema": "test-review"}) }))))
     }
 }
@@ -996,7 +996,7 @@ fn run_reviewed_hero_min(capture: &Image, approved: Option<&Image>, html: &str, 
     let io = ws.io();
     let receipt = json!({"status":"ok","score":0.9,"file":"art.png","assetHash":sha256_file(&io,"art.png"),"compHash":sha256_file(&io,"comp.png"),"regionHash":sha256_bytes(util::json_pretty(&art).as_bytes()),"referenceHash":plate_reference_hash(&spec)});
     let mut state = json!({"comp":"comp.png","capturePolicy":"native-html-v1","plates":{"art":receipt},"phases":{"hero":{}}});
-    let renderer = ReviewedRenderer { hero: png(capture), approved: approved.map(png) };
+    let renderer = ReviewedRenderer { hero: png(capture), approved: approved.map(png), report: json!({}) };
     let gate = gate_hero(&io, &mut state, "unused.png", min, "diff", Some("index.html"), &no_organic_scan, Some(&renderer));
     let report = serde_json::from_slice(&std::fs::read(ws.path.join("diff/report.json")).unwrap()).unwrap();
     (gate, report)
@@ -1170,7 +1170,7 @@ fn run_text_only_hero(capture: &Image, approved: Option<&Image>) -> (Gate, Value
     ws.write(SPEC_PATH, util::json_pretty(&spec).as_bytes());
     let io = ws.io();
     let mut state = json!({"comp":"comp.png","capturePolicy":"native-html-v1","phases":{"hero":{}}});
-    let renderer = ReviewedRenderer { hero: png(capture), approved: approved.map(png) };
+    let renderer = ReviewedRenderer { hero: png(capture), approved: approved.map(png), report: json!({"captureMethod":"assembled-page-viewport"}) };
     let gate = gate_hero(&io, &mut state, "unused.png", HERO_MIN, "diff", Some("index.html"), &no_organic_scan, Some(&renderer));
     let report = serde_json::from_slice(&std::fs::read(ws.path.join("diff/report.json")).unwrap()).unwrap();
     (gate, report)
@@ -1184,7 +1184,10 @@ fn text_only_first_viewport_gets_region_readings_from_the_native_frame() {
     assert!(gate.score.is_some_and(|s| s >= HERO_MIN), "{:?}", gate.score);
     let ids: Vec<_> = report["regions"].as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
     assert!(ids.contains(&"headline") && ids.contains(&"export"), "{ids:?}");
-    assert!(report["nativeCapture"].is_object(), "{report}");
+    // No raster region: the report must not claim the presence checks ran.
+    let scope = report["nativeCapture"]["integrityScope"].as_str().unwrap();
+    assert!(scope.contains("no raster presence") && !scope.starts_with("rendered presence"), "{scope}");
+    assert!(report["nativeCapture"]["framePolicy"].is_null(), "{report}");
     // A restyled headline is read as a text reading, not as a capture failure.
     let (gate, _) = run_text_only_hero(&text_only_hero(true), None);
     assert!(!gate.ok);
