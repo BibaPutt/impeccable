@@ -54,7 +54,7 @@ fn crop_viewport(png: &[u8], width: u32, height: u32, clip: [f64; 4]) -> Result<
         &image, rect.x as f64, rect.y as f64, rect.w as f64, rect.h as f64,
     ), &[])
 }
-fn render_page(
+pub(crate) fn render_page(
     browser: &mut Browser,
     snapshot: Arc<HtmlSnapshot>,
     width: u32,

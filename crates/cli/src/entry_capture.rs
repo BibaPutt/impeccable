@@ -2,6 +2,12 @@
 use crate::{
     asset_capture::CdpAssetRenderer,
     capture_snapshot::{HtmlSnapshot, SnapshotSelection},
+    component_capture::render_page,
+};
+use impeccable_browser::{
+    cdp::Browser,
+    discovery,
+    html_snapshot::{HtmlSnapshot as PageSnapshot, SnapshotSelection as PageSelection},
 };
 use impeccable_comp_verbs::entry_capture::{
     CapturedEntry, EntryEvidence, EntryRenderer, EntryRequest, EntryStage, FrameEvidence,
@@ -10,8 +16,14 @@ use serde_json::{Value, json};
 use std::{fs, path::Path, sync::Arc};
 
 pub struct CdpEntryRenderer;
+/// The frozen inputs a capture was drawn from. Raster entries keep the asset
+/// adapter's snapshot; text-only entries keep the assembled-page snapshot.
+enum Frozen {
+    Raster(Arc<HtmlSnapshot>),
+    Page(Arc<PageSnapshot>),
+}
 struct FrozenEntry {
-    snapshot: Arc<HtmlSnapshot>,
+    snapshot: Frozen,
     evidence: EntryEvidence,
 }
 impl CapturedEntry for FrozenEntry {
@@ -19,7 +31,10 @@ impl CapturedEntry for FrozenEntry {
         &self.evidence
     }
     fn verify_current(&self) -> Result<(), String> {
-        self.snapshot.verify_current()
+        match &self.snapshot {
+            Frozen::Raster(s) => s.verify_current(),
+            Frozen::Page(s) => s.verify_current(),
+        }
     }
 }
 impl EntryRenderer for CdpEntryRenderer {
@@ -45,9 +60,6 @@ impl EntryRenderer for CdpEntryRenderer {
             .filter(|r| r["medium"] == "raster")
             .map(|r| r["id"].as_str().ok_or("raster region missing id"))
             .collect::<Result<_, _>>()?;
-        if ids.is_empty() {
-            return Err("native raster capture requires at least one raster region; text-only capture is not supported yet".into());
-        }
         let width = spec["compSize"]["width"]
             .as_f64()
             .ok_or("missing reference width")?;
@@ -70,6 +82,9 @@ impl EntryRenderer for CdpEntryRenderer {
                 ),
             ],
         };
+        if ids.is_empty() {
+            return capture_text_only(request, &snapshot, &frames);
+        }
         let mut evidence = EntryEvidence {
             report: json!({"schema":"native-entry-capture-v1","inputSnapshot":snapshot.digest(),"manifest":snapshot.manifest(),"artifact":request.artifact,"stage":match request.stage {EntryStage::Hero=>"hero",EntryStage::Responsive=>"responsive"},"scope":"Fresh static HTML rendering and scoped raster evidence. No independent aesthetic approval."}),
             frames: vec![],
@@ -129,8 +144,84 @@ impl EntryRenderer for CdpEntryRenderer {
             });
         }
         snapshot.verify_current()?;
-        Ok(Box::new(FrozenEntry { snapshot, evidence }))
+        Ok(Box::new(FrozenEntry {
+            snapshot: Frozen::Raster(snapshot),
+            evidence,
+        }))
     }
+}
+
+/// A first viewport with no raster region has no asset to intervene on, so the
+/// asset adapter has nothing to measure. Capture each frame the way the
+/// assembled-page review captures the page it shows the user (same snapshot
+/// transport, pinned local scripts, verified dependencies, font check and
+/// double-screenshot stability), so an approved review screenshot and the gate's
+/// frame come from one capture method. Frames carry no region receipts: there is
+/// no rendered-presence check to run without artwork.
+fn capture_text_only(
+    request: &EntryRequest,
+    raster: &HtmlSnapshot,
+    frames: &[(&str, Option<[u32; 2]>)],
+) -> Result<Box<dyn CapturedEntry>, String> {
+    let spec: Value = serde_json::from_slice(raster.bytes(&request.spec).ok_or("missing bound spec")?)
+        .map_err(|e| e.to_string())?;
+    let size = |k: &str| {
+        spec["compSize"][k]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v > 0)
+            .ok_or_else(|| format!("missing reference {k}"))
+    };
+    let (width, height) = (size("width")?, size("height")?);
+    let page = Arc::new(PageSnapshot::freeze(PageSelection {
+        root: request.root.clone(),
+        entry: request.artifact.clone(),
+        served: static_inventory(&request.root)?,
+        bound: vec![request.spec.clone(), request.reference.clone()],
+    })?);
+    // Both snapshots hash the same manifest schema: equal digests mean the page
+    // was drawn from the very inputs the spec and reference checks just read.
+    if page.digest() != raster.digest() {
+        return Err("capture input changed: text-only snapshot differs from the bound inputs".into());
+    }
+    let env = impeccable_common::process_env();
+    let exe = discovery::find_browser(&env).map_err(|e| format!("browser unavailable: {e:?}"))?;
+    let mut browser = Browser::launch(&exe, &[], false).map_err(|e| e.message)?;
+    let result = (|| -> Result<EntryEvidence, String> {
+        let browser_version = browser.version().map_err(|e| e.message)?;
+        let mut evidence = EntryEvidence {
+            report: json!({"schema":"native-entry-capture-v1","inputSnapshot":page.digest(),"manifest":page.manifest(),"artifact":request.artifact,"stage":match request.stage {EntryStage::Hero=>"hero",EntryStage::Responsive=>"responsive"},"scope":"Fresh static HTML rendering of a first viewport with no raster region. No independent aesthetic approval.","captureMethod":"assembled-page-viewport","browser":browser_version,"frameProofs":{}}),
+            frames: vec![],
+        };
+        for &(name, viewport) in frames {
+            let [w, h] = viewport.unwrap_or([width, height]);
+            let (png, proof) = render_page(
+                &mut browser,
+                page.clone(),
+                w,
+                h,
+                &json!({"x":0,"y":0,"w":1,"h":1}),
+                None,
+                true,
+                true,
+            )
+            .map_err(|e| format!("{name} text-only capture failed: {e}"))?;
+            evidence.report["frameProofs"][name] = proof;
+            evidence.frames.push(FrameEvidence {
+                name: name.into(),
+                png,
+                regions: vec![],
+            });
+        }
+        Ok(evidence)
+    })();
+    browser.close();
+    let evidence = result?;
+    page.verify_current()?;
+    Ok(Box::new(FrozenEntry {
+        snapshot: Frozen::Page(page),
+        evidence,
+    }))
 }
 
 /// Enumerate only static browser files. Never serve hidden state, source-only
