@@ -18,6 +18,12 @@ use std::{
 };
 
 pub struct CdpEntryRenderer;
+/// Largest share of a frame that images may cover when the spec declares no
+/// raster region. Logos, avatars and icons sit well under it (a 200x60 logo is
+/// about 1% of a 1440x900 viewport; a row of twelve 40px avatars under 2%); a
+/// chart, photo or copied comp that carries real weight in the comparison sits
+/// well over it.
+pub const TEXT_ONLY_RASTER_SHARE_MAX: f64 = 0.15;
 /// The frozen inputs a capture was drawn from. A text-only capture also binds
 /// the hero review manifest whose dependency list chose what the page may load.
 struct FrozenEntry {
@@ -220,20 +226,24 @@ fn capture_text_only(
             continue;
         }
         let bytes = raster.bytes(&name).ok_or_else(|| format!("{name} is not in the frozen inputs"))?;
-        if let Some(reason) = forbidden_content(&name, bytes, &forbidden) {
-            return Err(format!("text-only first viewport serves {name}, which {reason}. The page must draw the first viewport in code, not show the approved reference."));
+        // A declared dependency is part of the reviewed page, so check it up front.
+        // Under the inventory, only what the page actually loads is checked (below),
+        // so an unused backup of the comp does not block an honest page.
+        if declared.is_some() {
+            if let Some(reason) = forbidden_content(&name, bytes, &forbidden) {
+                return Err(format!("text-only first viewport declares {name}, which {reason}. The page must draw the first viewport in code, not show the approved reference."));
+            }
         }
         files.insert(name, bytes.to_vec());
     }
     let page = Arc::new(PageSnapshot::from_pinned(request.artifact.clone(), files)?);
-    let forbidden_hashes: Vec<String> = forbidden.iter().map(|b| capture_sha256(b)).collect();
     let env = impeccable_common::process_env();
     let exe = discovery::find_browser(&env).map_err(|e| format!("browser unavailable: {e:?}"))?;
     let mut browser = Browser::launch(&exe, &[], false).map_err(|e| e.message)?;
     let result = (|| -> Result<EntryEvidence, String> {
         let browser_version = browser.version().map_err(|e| e.message)?;
         let mut evidence = EntryEvidence {
-            report: json!({"schema":"native-entry-capture-v1","inputSnapshot":raster.digest(),"manifest":raster.manifest(),"artifact":request.artifact,"stage":match request.stage {EntryStage::Hero=>"hero",EntryStage::Responsive=>"responsive"},"scope":"Fresh static HTML rendering of a first viewport with no raster region. No independent aesthetic approval.","captureMethod":"assembled-page-viewport","integrityScope":"assembled-page viewport from frozen inputs; the comp and approved screenshots are never served; no raster presence check (no raster region)","dependencyPolicy":policy,"servedToPage":page.manifest()["files"],"browser":browser_version,"frameProofs":{}}),
+            report: json!({"schema":"native-entry-capture-v1","inputSnapshot":raster.digest(),"manifest":raster.manifest(),"artifact":request.artifact,"stage":match request.stage {EntryStage::Hero=>"hero",EntryStage::Responsive=>"responsive"},"scope":"Fresh static HTML rendering of a first viewport with no raster region. No independent aesthetic approval.","captureMethod":"assembled-page-viewport","integrityScope":"assembled-page viewport from frozen inputs; the comp and approved screenshots are never served; images cover under 15% of each frame; no raster presence check (no raster region)","dependencyPolicy":policy,"servedToPage":page.manifest()["files"],"browser":browser_version,"frameProofs":{}}),
             frames: vec![],
         };
         for &(name, viewport) in frames {
@@ -247,6 +257,7 @@ fn capture_text_only(
                 None,
                 true,
                 true,
+                true,
             )
             .map_err(|e| {
                 // Both the network check and the image-decode check name the path
@@ -258,9 +269,22 @@ fn capture_text_only(
                     format!("{name} text-only capture failed: {e}")
                 }
             })?;
-            let loaded = proof["observedDependencies"].as_object().into_iter().flatten();
-            if let Some((path, _)) = loaded.into_iter().find(|(_, h)| forbidden_hashes.iter().any(|f| h.as_str() == Some(f))) {
-                return Err(format!("{name} text-only capture refused: the page loads {path}, a copy of the approved reference. Draw the first viewport in code."));
+            for path in proof["observedDependencies"].as_object().into_iter().flatten().map(|(p, _)| p) {
+                let bytes = page.bytes(path).ok_or("observed dependency is not in the page snapshot")?;
+                if let Some(reason) = forbidden_content(path, bytes, &forbidden) {
+                    return Err(format!("{name} text-only capture refused: the page loads {path}, which {reason}. Draw the first viewport in code."));
+                }
+            }
+            // Byte checks cannot see a re-encoded copy. The spec says every raster
+            // in this viewport is a raster region and it declares none, so a large
+            // image contradicts the spec whatever its bytes are.
+            let coverage = &proof["rasterCoverage"];
+            let share = coverage["share"].as_f64().ok_or("raster coverage was not measured")?;
+            if share >= TEXT_ONLY_RASTER_SHARE_MAX {
+                let largest = coverage["largest"].as_array().into_iter().flatten().take(3)
+                    .map(|i| format!("{} ({}% of the viewport)", i["what"].as_str().unwrap_or("image"), (i["share"].as_f64().unwrap_or(0.) * 100.).round()))
+                    .collect::<Vec<_>>().join(", ");
+                return Err(format!("{name} text-only capture refused: images cover {}% of the viewport (limit {}%): {largest}. The spec declares no raster region, so a large image contradicts it: declare the image as a raster region in the spec (comp-spec --regions), or remove it and draw that area in code.", (share * 100.).round(), (TEXT_ONLY_RASTER_SHARE_MAX * 100.) as u32));
             }
             evidence.report["frameProofs"][name] = proof;
             evidence.frames.push(FrameEvidence {
@@ -320,12 +344,14 @@ fn forbidden_content(name: &str, bytes: &[u8], forbidden: &[&[u8]]) -> Option<&'
         Some("html" | "htm" | "css" | "js" | "mjs" | "svg")
     )
     .then(|| String::from_utf8_lossy(bytes));
+    // Line breaks and spaces inside a data URI do not change the image it decodes to.
+    let text = text.map(|t| t.chars().filter(|c| !c.is_whitespace()).collect::<String>());
     for image in forbidden {
         if bytes == *image {
             return Some("is a copy of the approved reference");
         }
         // A data URI of the image carries its base64 from the first byte, so a
-        // leading run of it identifies the embed (line breaks aside).
+        // leading run of it identifies the embed.
         if let Some(text) = &text {
             let encoded = base64::engine::general_purpose::STANDARD.encode(image);
             let probe = &encoded[..encoded.len().min(512)];

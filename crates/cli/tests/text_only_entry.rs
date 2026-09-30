@@ -314,3 +314,64 @@ fn text_only_page_is_served_the_hero_review_dependencies() {
     let e = refusal(&f);
     assert!(e.contains(".env") && e.contains("never served"), "{e}");
 }
+
+fn capture_with(f: &Fixture, html: &str) -> Result<(), String> {
+    fs::write(f.project.join("index.html"), html).unwrap();
+    CdpEntryRenderer.capture_entry(&f.request(EntryStage::Hero)).map(|_| ())
+}
+
+#[test]
+fn unused_backup_of_the_comp_does_not_block_an_honest_page() {
+    if !browser_available() {
+        return;
+    }
+    let f = Fixture::new();
+    fs::create_dir_all(f.project.join("backup")).unwrap();
+    fs::copy(f.project.join("comp.png"), f.project.join("backup/comp-old.png")).unwrap();
+    capture_with(&f, PAGE).unwrap();
+    // Loading that same backup is refused.
+    let e = capture_with(&f, &format!("{PAGE}<img src=\"backup/comp-old.png\" style=\"width:8px\">")).unwrap_err();
+    assert!(e.contains("backup/comp-old.png") && e.contains("copy of the approved reference"), "{e}");
+}
+
+#[test]
+fn wrapped_data_uri_of_the_comp_is_refused() {
+    if !browser_available() {
+        return;
+    }
+    let f = Fixture::new();
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(fs::read(f.project.join("comp.png")).unwrap());
+    let wrapped = encoded.as_bytes().chunks(76).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("\n  ");
+    let e = capture_with(&f, &format!("<!doctype html><img style=\"width:8px\" src=\"data:image/png;base64,\n  {wrapped}\">")).unwrap_err();
+    assert!(e.contains("index.html") && e.contains("data URI"), "{e}");
+}
+
+#[test]
+fn large_images_contradict_a_spec_without_raster_regions_but_logos_do_not() {
+    if !browser_available() {
+        return;
+    }
+    let f = Fixture::new();
+    fs::create_dir_all(f.project.join("assets")).unwrap();
+    // The comp re-encoded (same pixels, different bytes) evades every byte check,
+    // so the coverage rule is what refuses it.
+    let comp = png_io::decode_png(&fs::read(f.project.join("comp.png")).unwrap()).unwrap().image;
+    let reencoded = png_io::encode_png(&comp, &[("Comment".into(), "re-encoded".into())]).unwrap();
+    assert_ne!(reencoded, fs::read(f.project.join("comp.png")).unwrap());
+    fs::write(f.project.join("assets/reencoded.png"), reencoded).unwrap();
+    let e = capture_with(&f, "<!doctype html><style>body{margin:0}img{display:block;width:240px;height:160px}</style><img src=\"assets/reencoded.png\">").unwrap_err();
+    assert!(e.contains("images cover 100% of the viewport") && e.contains("declares no raster region"), "{e}");
+    // A chart exported as an image is a raster region, not code.
+    let chart = png_io::encode_png(&raster::create_image(120, 80, [30, 90, 200, 255]), &[]).unwrap();
+    fs::write(f.project.join("assets/chart.png"), chart).unwrap();
+    let e = capture_with(&f, &format!("{PAGE}<img src=\"assets/chart.png\" style=\"position:absolute;left:100px;top:40px;width:120px;height:80px\">")).unwrap_err();
+    assert!(e.contains("img") && e.contains("25%") && e.contains("declare the image as a raster region"), "{e}");
+    // As a CSS background it is the same material.
+    let e = capture_with(&f, &format!("{PAGE}<div style=\"position:absolute;left:100px;top:40px;width:120px;height:80px;background:url(assets/chart.png)\"></div>")).unwrap_err();
+    assert!(e.contains("background"), "{e}");
+    // A small logo is fine.
+    let logo = png_io::encode_png(&raster::create_image(16, 16, [200, 60, 30, 255]), &[]).unwrap();
+    fs::write(f.project.join("assets/logo.png"), logo).unwrap();
+    capture_with(&f, &format!("{PAGE}<img src=\"assets/logo.png\" style=\"position:absolute;right:8px;top:8px;width:16px;height:16px\">")).unwrap();
+}
