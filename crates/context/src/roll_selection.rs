@@ -127,6 +127,24 @@ fn pick_from_families(order: &[Value], count: usize) -> Vec<Value> {
     picks
 }
 
+/// JS: rankTier. A tier's pool in ticket order, one entry per concept.
+fn rank_tier(pool: &[Value], salt_input: &str) -> Vec<Value> {
+    let mut tickets = challenger_tickets(pool);
+    if tickets.is_empty() {
+        tickets = pool.iter().map(|c| Ticket { item: c.clone(), ticket: 0 }).collect();
+    }
+    let ranked = rank(&tickets, salt_input, |e| format!("{}#{}", s(&e.item, "id").unwrap_or(""), e.ticket));
+    let mut ordered: Vec<Value> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for e in ranked {
+        let id = s(&e.item, "id").unwrap_or("").to_string();
+        if seen.insert(id) {
+            ordered.push(e.item);
+        }
+    }
+    ordered
+}
+
 pub struct ChallengerSelection {
     pub approved: Vec<Value>,
     pub picks: Vec<Value>,
@@ -202,30 +220,25 @@ pub fn select_approved_challengers(
                 continue;
             }
             let full = by_tier.get(tier).cloned().unwrap_or_default();
-            let mut pool: Vec<Value> = full.iter().filter(|c| !excluded.contains(s(c, "id").unwrap_or(""))).cloned().collect();
-            // Reuse over starvation; under a quota, also when the tier can no
-            // longer fill its quota, so a re-roll still deals six.
-            if pool.is_empty() || (quotas.is_some() && pool.len() < quota) {
-                pool = full;
+            let fresh: Vec<Value> = full.iter().filter(|c| !excluded.contains(s(c, "id").unwrap_or(""))).cloned().collect();
+            let salt_input = format!("{}:{}:challenger-{}{}", scope, key, index, salt);
+            // Reuse over starvation.
+            let first_pool = if fresh.is_empty() { &full } else { &fresh };
+            let mut tier_picks = pick_from_families(&rank_tier(first_pool, &salt_input), quota);
+            // Under a quota, a tier whose unseen worlds cannot fill the quota
+            // deals every unseen one first and only then tops up from worlds
+            // already shown, so a late re-roll never repeats a world ahead of a
+            // new one.
+            if quotas.is_some() && tier_picks.len() < quota && !fresh.is_empty() && fresh.len() < full.len() {
+                let rest: Vec<Value> = full
+                    .iter()
+                    .filter(|c| !tier_picks.iter().any(|p| s(p, "id") == s(c, "id")))
+                    .cloned()
+                    .collect();
+                let more = pick_from_families(&rank_tier(&rest, &salt_input), quota - tier_picks.len());
+                tier_picks.extend(more);
             }
-            let mut tickets = challenger_tickets(&pool);
-            if tickets.is_empty() {
-                tickets = pool.iter().map(|c| Ticket { item: c.clone(), ticket: 0 }).collect();
-            }
-            let ranked = rank(&tickets, &format!("{}:{}:challenger-{}{}", scope, key, index, salt), |e| {
-                format!("{}#{}", s(&e.item, "id").unwrap_or(""), e.ticket)
-            });
-            let mut ordered: Vec<Value> = Vec::new();
-            let mut seen: HashSet<String> = HashSet::new();
-            for e in ranked {
-                let id = s(&e.item, "id").unwrap_or("").to_string();
-                if seen.contains(&id) {
-                    continue;
-                }
-                seen.insert(id);
-                ordered.push(e.item);
-            }
-            picks.extend(pick_from_families(&ordered, quota));
+            picks.extend(tier_picks);
         }
         picks
     };

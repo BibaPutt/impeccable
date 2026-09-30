@@ -1608,11 +1608,11 @@
    "key": "alpha",
    "reroll": 1,
    "picks": [
+    "graphic-f3-c2",
     "graphic-f1-c0",
     "graphic-f0-c2",
     "graphic-f2-c2",
     "graphic-f3-c0",
-    "graphic-f2-c0",
     "interaction-f3-c2"
    ]
   },
@@ -1668,8 +1668,8 @@
    "key": "beta",
    "reroll": 1,
    "picks": [
-    "graphic-f1-c0",
     "graphic-f3-c2",
+    "graphic-f1-c0",
     "graphic-f2-c0",
     "graphic-f0-c2",
     "graphic-f3-c0",
@@ -1729,11 +1729,11 @@
    "reroll": 1,
    "picks": [
     "interaction-f1-c2",
-    "graphic-f3-c0",
     "graphic-f2-c0",
+    "graphic-f3-c0",
     "graphic-f1-c0",
-    "graphic-f0-c2",
-    "graphic-f3-c2"
+    "graphic-f2-c2",
+    "graphic-f0-c2"
    ]
   },
   {
@@ -1789,11 +1789,11 @@
    "reroll": 1,
    "picks": [
     "interaction-f3-c2",
+    "graphic-f3-c0",
     "graphic-f2-c0",
     "graphic-f1-c0",
     "graphic-f0-c2",
-    "graphic-f3-c0",
-    "graphic-f2-c2"
+    "graphic-f3-c2"
    ]
   },
   {
@@ -1848,11 +1848,11 @@
    "key": "alpha",
    "reroll": 1,
    "picks": [
+    "graphic-f1-c0",
     "graphic-f1-c1",
     "graphic-f3-c0",
     "graphic-f2-c1",
     "graphic-f0-c1",
-    "graphic-f1-c0",
     "interaction-f2-c0"
    ]
   },
@@ -1908,10 +1908,10 @@
    "key": "beta",
    "reroll": 1,
    "picks": [
+    "graphic-f1-c0",
     "graphic-f3-c0",
     "graphic-f2-c0",
     "graphic-f0-c1",
-    "graphic-f1-c0",
     "graphic-f1-c1",
     "interaction-f1-c1"
    ]
@@ -1968,11 +1968,11 @@
    "key": "gamma",
    "reroll": 1,
    "picks": [
+    "graphic-f2-c0",
     "graphic-f0-c1",
     "graphic-f1-c0",
     "graphic-f2-c1",
     "graphic-f3-c0",
-    "graphic-f1-c1",
     "interaction-f0-c1"
    ]
   },
@@ -2029,11 +2029,11 @@
    "reroll": 1,
    "picks": [
     "interaction-f1-c1",
+    "graphic-f1-c0",
     "graphic-f0-c1",
     "graphic-f3-c0",
-    "graphic-f1-c0",
     "graphic-f2-c1",
-    "graphic-f2-c0"
+    "graphic-f1-c1"
    ]
   },
   {
