@@ -3,13 +3,15 @@
 use impeccable::entry_capture::CdpEntryRenderer;
 use impeccable::reviewed_entry::ReviewedEntryRenderer;
 use impeccable_comp::{png_io, raster};
+use impeccable_common::Io;
 use impeccable_comp_verbs::asset_capture::capture_sha256;
+use impeccable_comp_verbs::build_phase;
 use impeccable_comp_verbs::entry_capture::{EntryRenderer, EntryRequest, EntryStage};
 use serde_json::{Value, json};
 use std::{
     fs,
     path::PathBuf,
-    process::{Command, Output},
+    collections::HashMap,
     sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -59,28 +61,34 @@ impl Fixture {
             stage,
         }
     }
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_impeccable"))
-            .args(args)
-            .current_dir(&self.project)
-            .env("HOME", &self.home)
-            .env("USERPROFILE", &self.home)
-            .env("IMPECCABLE_NATIVE_CAPTURE", "1")
-            .env_remove("IMPECCABLE_COMPONENT_REVIEW_TOOL")
-            .env_remove("IMPECCABLE_COMPONENT_REVIEW_SESSIONS")
-            .env_remove("IMPECCABLE_CAPTURE_PORT")
-            .env_remove("IMPECCABLE_CAPTURE_CAPABILITY")
-            .output()
-            .unwrap()
+    /// `build-phase` in process, the way the binary wires it for a standalone
+    /// native build. Only the verb's own environment names the temporary home;
+    /// the browser launches from the real process environment.
+    fn run(&self, args: &[&str]) -> (i32, String) {
+        let env = HashMap::from([
+            ("HOME".to_string(), self.home.display().to_string()),
+            ("USERPROFILE".to_string(), self.home.display().to_string()),
+            ("IMPECCABLE_NATIVE_CAPTURE".to_string(), "1".to_string()),
+        ]);
+        let (mut io, captured) = Io::captured("", self.project.clone(), env);
+        let renderer = ReviewedEntryRenderer::local(&self.project, io.home().as_deref());
+        let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let code = build_phase::run_with_renderer(&argv, &mut io, &build_phase::no_organic_scan, Some(&renderer));
+        drop(io);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&captured.stdout.borrow()),
+            String::from_utf8_lossy(&captured.stderr.borrow())
+        );
+        (code, text)
     }
     fn record_hero(&self) -> (bool, String, Value) {
-        let out = self.run(&["build-phase", "record", "hero", "--min", "0.95"]);
-        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let (code, text) = self.run(&["record", "hero", "--min", "0.95"]);
         let report = fs::read(self.project.join(".impeccable/review/diff/hero/report.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(Value::Null);
-        (out.status.code() == Some(0), text, report)
+        (code == 0, text, report)
     }
     /// The local review store entry for an approved assembled first viewport,
     /// in the shape the component-review capture writes.
@@ -176,8 +184,8 @@ fn hero_gate_reads_a_text_only_first_viewport_and_honours_an_accepted_review() {
     let lettered = strokes("90deg");
     fs::write(f.project.join("index.html"), &lettered).unwrap();
     let hero = CdpEntryRenderer.capture_entry(&f.request(EntryStage::Hero)).unwrap().evidence().frames[0].png.clone();
-    let start = f.run(&["build-phase", "start", "--comp", "comp.png", "--artifact", "index.html"]);
-    assert!(start.status.success(), "{}", String::from_utf8_lossy(&start.stderr));
+    let (code, text) = f.run(&["start", "--comp", "comp.png", "--artifact", "index.html"]);
+    assert_eq!(code, 0, "{text}");
 
     // The gate measures the page and fails on its readings, not on capture.
     let (ok, text, report) = f.record_hero();
