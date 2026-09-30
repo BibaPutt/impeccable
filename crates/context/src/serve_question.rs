@@ -199,12 +199,12 @@ fn generated_dir(qdir: &str, key: &str) -> String {
 /// `generated` (markers from another digest are ignored).
 fn read_hand(qdir: &str, key: &str) -> Option<Map<String, Value>> {
     let mut hand = safe_read(&hand_file(qdir, key)).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned())?;
-    let digest = hand.get("digest").and_then(Value::as_str).unwrap_or("").to_string();
+    let id = hand_marker_id(&hand);
     let mut generated: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(generated_dir(qdir, key)) {
         for e in entries.flatten() {
             let Some(m) = safe_read(&e.path().to_string_lossy()).and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
-            if m.get("digest").and_then(Value::as_str) == Some(digest.as_str()) {
+            if m.get("hand").or_else(|| m.get("digest")).and_then(Value::as_str) == Some(id.as_str()) {
                 if let Some(slot) = m.get("slot").and_then(Value::as_str) {
                     generated.push(slot.to_string());
                 }
@@ -253,7 +253,7 @@ pub fn record_generated(cwd: &str, out: &str) -> Result<Vec<String>, String> {
     let mut marked = Vec::new();
     for key in keys {
         let Some(hand) = read_hand(&qdir, &key) else { continue };
-        let digest = hand.get("digest").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = hand_marker_id(&hand);
         for slot in round_comps(Some(&hand), None) {
             if !same_path(&jsp::resolve(cwd, &[slot.as_str()]), &out_abs) {
                 continue;
@@ -261,7 +261,7 @@ pub fn record_generated(cwd: &str, out: &str) -> Result<Vec<String>, String> {
             let dir = generated_dir(&qdir, &key);
             let marker = jsp::join(&[&dir, &format!("{}.json", hand_digest(&Value::String(slot.clone())))]);
             std::fs::create_dir_all(&dir)
-                .and_then(|_| write_atomic(&marker, &json_compact(&json!({ "slot": slot, "digest": digest }))))
+                .and_then(|_| write_atomic(&marker, &json_compact(&json!({ "slot": slot, "hand": id }))))
                 .map_err(|e| format!("{}: {}", marker, e))?;
             marked.push(key.clone());
         }
@@ -280,19 +280,43 @@ fn new_hand(cwd: &str, payload: &Value) -> Map<String, Value> {
         }
     }
     let mut m = Map::new();
+    // A per-hand id: an --update re-roll can repeat a payload, so the digest
+    // alone cannot tell one hand's generated markers from the next one's.
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    m.insert("id".into(), Value::String(hand_digest(&json!([hand_digest(payload), nonce.to_string(), std::process::id()]))));
     m.insert("digest".into(), Value::String(hand_digest(payload)));
     m.insert("comps".into(), json!(comps));
     m.insert("pre".into(), Value::Object(pre));
     m
 }
 
-/// Temp file then rename, so a reader never sees half a hand.
-/// Records a new hand: clears the previous hand's generated markers, then
-/// writes the hand file atomically. The error names the file.
+/// Records a new hand atomically (temp file then rename, so a reader never
+/// sees half a hand), then prunes generated markers that belong to another
+/// hand. Pruning waits for a successful write, so a failed write leaves the
+/// live hand and its markers intact, and it spares this hand's own markers,
+/// which a parallel generate-image may already have written. The error names
+/// the file.
 fn write_hand(qdir: &str, key: &str, hand: &Map<String, Value>) -> Result<(), String> {
-    let _ = std::fs::remove_dir_all(generated_dir(qdir, key));
     let target = hand_file(qdir, key);
-    write_atomic(&target, &json_compact(&Value::Object(hand.clone()))).map_err(|e| format!("{}: {}", target, e))
+    write_atomic(&target, &json_compact(&Value::Object(hand.clone()))).map_err(|e| format!("{}: {}", target, e))?;
+    let id = hand_marker_id(hand);
+    if let Ok(entries) = std::fs::read_dir(generated_dir(qdir, key)) {
+        for e in entries.flatten() {
+            let owner = safe_read(&e.path().to_string_lossy())
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .and_then(|m| m.get("hand").or_else(|| m.get("digest")).and_then(Value::as_str).map(str::to_string));
+            if owner.as_deref() != Some(id.as_str()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a generated marker records as its hand: the hand's id, or its digest
+/// for a hand file written before ids existed.
+fn hand_marker_id(hand: &Map<String, Value>) -> String {
+    hand.get("id").or_else(|| hand.get("digest")).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
 /// The hand a `--start` serves: the recorded one when the key's hand file
@@ -564,6 +588,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         if !keeps_open {
             let _ = std::fs::remove_file(state_file(&qdir, &key));
             let _ = std::fs::remove_file(hand_file(&qdir, &key));
+            let _ = std::fs::remove_dir_all(generated_dir(&qdir, &key));
         }
         return 0;
     }
@@ -581,6 +606,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         let _ = std::fs::remove_file(answer_file(&qdir, &key));
         let _ = std::fs::remove_file(state_file(&qdir, &key));
         let _ = std::fs::remove_file(hand_file(&qdir, &key));
+            let _ = std::fs::remove_dir_all(generated_dir(&qdir, &key));
         io.out("stopped\n");
         return 0;
     }
@@ -1868,6 +1894,40 @@ mod tests {
         assert!(out.is_empty(), "{out}");
         assert!(err.contains("nothing was delivered"), "{err}");
         assert!(!std::path::Path::new(&next_file(&qdir, "k1")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn markers_survive_a_failed_hand_write_and_leave_with_the_question() {
+        let dir = temp_project("markers");
+        let cwd = dir.to_string_lossy().into_owned();
+        let qdir = jsp::join(&[&cwd, ".impeccable", "questions"]);
+        let payload = json!({ "options": [{ "id": "a", "comp": ".impeccable/mocks/decision/a.png" }] });
+        let live = new_hand(&cwd, &payload);
+        write_hand(&qdir, "k1", &live).unwrap();
+        std::fs::create_dir_all(dir.join(".impeccable/mocks/decision")).unwrap();
+        std::fs::write(dir.join(".impeccable/mocks/decision/a.png"), b"png").unwrap();
+        assert_eq!(record_generated(&cwd, ".impeccable/mocks/decision/a.png").unwrap(), vec!["k1".to_string()]);
+
+        // A failed write of the next hand keeps the live hand's marker.
+        let hand_path = hand_file(&qdir, "k1");
+        std::fs::remove_file(&hand_path).unwrap();
+        std::fs::create_dir_all(&hand_path).unwrap();
+        assert!(write_hand(&qdir, "k1", &new_hand(&cwd, &payload)).is_err());
+        std::fs::remove_dir_all(&hand_path).unwrap();
+        write_atomic(&hand_path, &json_compact(&Value::Object(live.clone()))).unwrap();
+        assert_eq!(read_hand(&qdir, "k1").unwrap().get("generated"), Some(&json!([".impeccable/mocks/decision/a.png"])));
+
+        // A new hand with the same payload does not inherit the old marker.
+        write_hand(&qdir, "k1", &new_hand(&cwd, &payload)).unwrap();
+        assert!(read_hand(&qdir, "k1").unwrap().get("generated").is_none());
+
+        // --stop takes the marker folder with the hand file.
+        record_generated(&cwd, ".impeccable/mocks/decision/a.png").unwrap();
+        write_state(&dir, &json!({ "pid": 0, "port": 1, "url": "http://127.0.0.1:1/" }));
+        let _ = run_captured(&dir, &["--stop", "--key", "k1"]);
+        assert!(!std::path::Path::new(&hand_file(&qdir, "k1")).exists());
+        assert!(!std::path::Path::new(&generated_dir(&qdir, "k1")).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
