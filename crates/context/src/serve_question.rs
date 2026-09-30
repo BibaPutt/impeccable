@@ -198,10 +198,12 @@ fn generated_dir(qdir: &str, key: &str) -> String {
 }
 
 /// The hand id as it appears in a marker file name: the id itself when it is
-/// a short run of `[A-Za-z0-9_]` (every id and digest this engine writes),
-/// else its hash, so a hand-edited id can never smuggle a separator or a dot.
+/// a short run of `[a-z0-9_]` (every id and digest this engine writes), else
+/// its hash, so a hand-edited id can never smuggle a separator or a dot, and
+/// two ids that differ only in case never share a path on a case-insensitive
+/// file system (Windows, default macOS).
 fn marker_tag(id: &str) -> String {
-    if !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
         id.to_string()
     } else {
         hand_digest(&Value::String(id.to_string()))
@@ -1999,6 +2001,12 @@ mod tests {
         assert_eq!(odd.len(), 16);
         assert!(odd.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(marker_tag(""), hand_digest(&Value::String(String::new())));
+        // Ids that differ only in case get distinct, all-lowercase tags, so
+        // they never share a path on a case-insensitive file system.
+        let (lower, upper) = (marker_tag("abc"), marker_tag("ABC"));
+        assert_eq!(lower, "abc");
+        assert_ne!(lower.to_lowercase(), upper.to_lowercase());
+        assert_eq!(upper, upper.to_lowercase());
     }
 
     // Issue #886: the prune used to read a marker's owner and then delete the
