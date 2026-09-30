@@ -1612,7 +1612,7 @@
     "graphic-f1-c0",
     "graphic-f0-c2",
     "graphic-f2-c2",
-    "graphic-f3-c0",
+    "graphic-f2-c0",
     "interaction-f3-c2"
    ]
   },
@@ -1732,8 +1732,8 @@
     "graphic-f2-c0",
     "graphic-f3-c0",
     "graphic-f1-c0",
-    "graphic-f2-c2",
-    "graphic-f0-c2"
+    "graphic-f0-c2",
+    "graphic-f3-c2"
    ]
   },
   {
@@ -1793,7 +1793,7 @@
     "graphic-f2-c0",
     "graphic-f1-c0",
     "graphic-f0-c2",
-    "graphic-f3-c2"
+    "graphic-f2-c2"
    ]
   },
   {
@@ -1849,10 +1849,10 @@
    "reroll": 1,
    "picks": [
     "graphic-f1-c0",
-    "graphic-f1-c1",
     "graphic-f3-c0",
     "graphic-f2-c1",
     "graphic-f0-c1",
+    "graphic-f1-c1",
     "interaction-f2-c0"
    ]
   },
@@ -1971,8 +1971,8 @@
     "graphic-f2-c0",
     "graphic-f0-c1",
     "graphic-f1-c0",
-    "graphic-f2-c1",
     "graphic-f3-c0",
+    "graphic-f1-c1",
     "interaction-f0-c1"
    ]
   },
@@ -2033,7 +2033,7 @@
     "graphic-f0-c1",
     "graphic-f3-c0",
     "graphic-f2-c1",
-    "graphic-f1-c1"
+    "graphic-f2-c0"
    ]
   },
   {

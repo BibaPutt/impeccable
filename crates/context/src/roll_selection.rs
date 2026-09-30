@@ -103,10 +103,11 @@ fn tier_quotas(mode: Option<&str>) -> Option<HashMap<String, usize>> {
 /// JS: pickFromFamilies. Up to `count` concepts in ranked order, preferring one
 /// from a family not yet picked, then any concept not yet picked. At a count of
 /// two this is exactly the first-then-different-family pick of every roll
-/// before quotas.
-fn pick_from_families(order: &[Value], count: usize) -> Vec<Value> {
+/// before quotas. `prior` are picks already in the hand, whose families count
+/// as taken.
+fn pick_from_families(order: &[Value], count: usize, prior: &[Value]) -> Vec<Value> {
     let mut picks: Vec<Value> = Vec::new();
-    let mut families: Vec<Value> = Vec::new();
+    let mut families: Vec<Value> = prior.iter().map(|c| c.get("familyId").cloned().unwrap_or(Value::Null)).collect();
     let id_of = |c: &Value| s(c, "id").unwrap_or("").to_string();
     while picks.len() < count {
         let picked = |c: &Value| picks.iter().any(|p| id_of(p) == id_of(c));
@@ -224,7 +225,7 @@ pub fn select_approved_challengers(
             let salt_input = format!("{}:{}:challenger-{}{}", scope, key, index, salt);
             // Reuse over starvation.
             let first_pool = if fresh.is_empty() { &full } else { &fresh };
-            let mut tier_picks = pick_from_families(&rank_tier(first_pool, &salt_input), quota);
+            let mut tier_picks = pick_from_families(&rank_tier(first_pool, &salt_input), quota, &[]);
             // Under a quota, a tier whose unseen worlds cannot fill the quota
             // deals every unseen one first and only then tops up from worlds
             // already shown, so a late re-roll never repeats a world ahead of a
@@ -235,7 +236,7 @@ pub fn select_approved_challengers(
                     .filter(|c| !tier_picks.iter().any(|p| s(p, "id") == s(c, "id")))
                     .cloned()
                     .collect();
-                let more = pick_from_families(&rank_tier(&rest, &salt_input), quota - tier_picks.len());
+                let more = pick_from_families(&rank_tier(&rest, &salt_input), quota - tier_picks.len(), &tier_picks);
                 tier_picks.extend(more);
             }
             picks.extend(tier_picks);
