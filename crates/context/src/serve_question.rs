@@ -188,11 +188,46 @@ fn file_fingerprint(abs: &str) -> Option<String> {
 }
 
 /// `<key>.generated/`: one marker per slot `impeccable generate-image` wrote
-/// during the hand, `<sha16 of slot>.json` = `{"slot", "digest"}`. A marker
-/// file per slot rather than a list inside the hand file, because parallel
-/// generators (one subagent per card) would race a shared read-modify-write.
+/// during the hand, `<sha16 of slot>-<hand tag>.json` = `{"slot", "hand"}`.
+/// A marker file per slot rather than a list inside the hand file, because
+/// parallel generators (one subagent per card) would race a shared
+/// read-modify-write. The hand tag in the name keeps one hand's markers off
+/// every path another hand writes, so pruning decides from the name alone.
 fn generated_dir(qdir: &str, key: &str) -> String {
     jsp::join(&[qdir, &format!("{}.generated", key)])
+}
+
+/// The hand id as it appears in a marker file name: the id itself when it is
+/// a short run of `[A-Za-z0-9_]` (every id and digest this engine writes),
+/// else its hash, so a hand-edited id can never smuggle a separator or a dot.
+fn marker_tag(id: &str) -> String {
+    if !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        id.to_string()
+    } else {
+        hand_digest(&Value::String(id.to_string()))
+    }
+}
+
+/// The marker file name for `slot` in the hand tagged `tag`.
+fn marker_name(slot: &str, tag: &str) -> String {
+    format!("{}-{}.json", hand_digest(&Value::String(slot.to_string())), tag)
+}
+
+/// The hand tag a marker file name carries: `Some(tag)` for
+/// `<16 hex>-<tag>.json` (or its `.json.tmp-<pid>` temp file), `None` for a
+/// legacy `<16 hex>.json` name, whose owner lives only in its content.
+fn marker_name_tag(name: &str) -> Option<&str> {
+    let stem = &name[..name.find(".json")?];
+    let (slot, tag) = (stem.get(..16)?, stem.get(16..)?);
+    let tag = tag.strip_prefix('-')?;
+    (slot.bytes().all(|b| b.is_ascii_hexdigit()) && !tag.is_empty()).then_some(tag)
+}
+
+/// The owner a legacy marker's content names (`hand`, else `digest`).
+fn legacy_marker_owner(path: &std::path::Path) -> Option<String> {
+    safe_read(&path.to_string_lossy())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|m| m.get("hand").or_else(|| m.get("digest")).and_then(Value::as_str).map(str::to_string))
 }
 
 /// The recorded hand, with the slots generated during it merged in as
@@ -200,11 +235,20 @@ fn generated_dir(qdir: &str, key: &str) -> String {
 fn read_hand(qdir: &str, key: &str) -> Option<Map<String, Value>> {
     let mut hand = safe_read(&hand_file(qdir, key)).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v.as_object().cloned())?;
     let id = hand_marker_id(&hand);
+    let tag = marker_tag(&id);
     let mut generated: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(generated_dir(qdir, key)) {
         for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".json") {
+                continue;
+            }
             let Some(m) = safe_read(&e.path().to_string_lossy()).and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
-            if m.get("hand").or_else(|| m.get("digest")).and_then(Value::as_str) == Some(id.as_str()) {
+            let ours = match marker_name_tag(&name) {
+                Some(t) => t == tag,
+                None => m.get("hand").or_else(|| m.get("digest")).and_then(Value::as_str) == Some(id.as_str()),
+            };
+            if ours {
                 if let Some(slot) = m.get("slot").and_then(Value::as_str) {
                     generated.push(slot.to_string());
                 }
@@ -212,6 +256,7 @@ fn read_hand(qdir: &str, key: &str) -> Option<Map<String, Value>> {
         }
     }
     generated.sort();
+    generated.dedup();
     if !generated.is_empty() {
         hand.insert("generated".into(), json!(generated));
     }
@@ -259,7 +304,7 @@ pub fn record_generated(cwd: &str, out: &str) -> Result<Vec<String>, String> {
                 continue;
             }
             let dir = generated_dir(&qdir, &key);
-            let marker = jsp::join(&[&dir, &format!("{}.json", hand_digest(&Value::String(slot.clone())))]);
+            let marker = jsp::join(&[&dir, &marker_name(&slot, &marker_tag(&id))]);
             std::fs::create_dir_all(&dir)
                 .and_then(|_| write_atomic(&marker, &json_compact(&json!({ "slot": slot, "hand": id }))))
                 .map_err(|e| format!("{}: {}", marker, e))?;
@@ -293,19 +338,25 @@ fn new_hand(cwd: &str, payload: &Value) -> Map<String, Value> {
 /// Records a new hand atomically (temp file then rename, so a reader never
 /// sees half a hand), then prunes generated markers that belong to another
 /// hand. Pruning waits for a successful write, so a failed write leaves the
-/// live hand and its markers intact, and it spares this hand's own markers,
-/// which a parallel generate-image may already have written. The error names
-/// the file.
+/// live hand and its markers intact. It decides from the file name alone and
+/// deletes only names tagged with another hand, so it never touches a path a
+/// parallel generate-image for this hand may be writing. A legacy untagged
+/// marker (written before names carried the hand) is judged by its content;
+/// this engine never writes that name again, so no new marker can land there.
+/// The error names the file.
 fn write_hand(qdir: &str, key: &str, hand: &Map<String, Value>) -> Result<(), String> {
     let target = hand_file(qdir, key);
     write_atomic(&target, &json_compact(&Value::Object(hand.clone()))).map_err(|e| format!("{}: {}", target, e))?;
     let id = hand_marker_id(hand);
+    let tag = marker_tag(&id);
     if let Ok(entries) = std::fs::read_dir(generated_dir(qdir, key)) {
         for e in entries.flatten() {
-            let owner = safe_read(&e.path().to_string_lossy())
-                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-                .and_then(|m| m.get("hand").or_else(|| m.get("digest")).and_then(Value::as_str).map(str::to_string));
-            if owner.as_deref() != Some(id.as_str()) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let prune = match marker_name_tag(&name) {
+                Some(t) => t != tag,
+                None => legacy_marker_owner(&e.path()).as_deref() != Some(id.as_str()),
+            };
+            if prune {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -1928,6 +1979,99 @@ mod tests {
         let _ = run_captured(&dir, &["--stop", "--key", "k1"]);
         assert!(!std::path::Path::new(&hand_file(&qdir, "k1")).exists());
         assert!(!std::path::Path::new(&generated_dir(&qdir, "k1")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_names_carry_the_hand_tag() {
+        let slot = ".impeccable/mocks/decision/a.png";
+        let name = marker_name(slot, "abc123");
+        assert_eq!(name, format!("{}-abc123.json", hand_digest(&Value::String(slot.into()))));
+        assert_eq!(marker_name_tag(&name), Some("abc123"));
+        assert_eq!(marker_name_tag(&format!("{}.tmp-42", name)), Some("abc123"));
+        // A legacy name carries no tag; neither does a stray file.
+        assert_eq!(marker_name_tag(&format!("{}.json", hand_digest(&Value::String(slot.into())))), None);
+        assert_eq!(marker_name_tag("notes.txt"), None);
+        assert_eq!(marker_name_tag("zzzzzzzzzzzzzzzz-abc.json"), None);
+        // An id that could not sit in a file name safely is hashed.
+        assert_eq!(marker_tag("0123456789abcdef"), "0123456789abcdef");
+        let odd = marker_tag("..\\x/y.json");
+        assert_eq!(odd.len(), 16);
+        assert!(odd.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(marker_tag(""), hand_digest(&Value::String(String::new())));
+    }
+
+    // Issue #886: the prune used to read a marker's owner and then delete the
+    // file, so a parallel generate-image for the new hand that replaced a
+    // reused slot's marker between the read and the delete lost its marker.
+    // Markers now carry the hand in their name: the new hand writes a path the
+    // old hand never used, and the prune decides from names alone.
+    #[test]
+    fn prune_spares_a_parallel_marker_for_the_new_hand_in_a_reused_slot() {
+        let dir = temp_project("marker-race");
+        let cwd = dir.to_string_lossy().into_owned();
+        let qdir = jsp::join(&[&cwd, ".impeccable", "questions"]);
+        let slot = ".impeccable/mocks/decision/a.png";
+        let payload = json!({ "options": [{ "id": "a", "comp": slot }] });
+        std::fs::create_dir_all(dir.join(".impeccable/mocks/decision")).unwrap();
+        std::fs::write(dir.join(slot), b"png").unwrap();
+
+        // The old hand generated into the slot.
+        let old = new_hand(&cwd, &payload);
+        write_hand(&qdir, "k1", &old).unwrap();
+        record_generated(&cwd, slot).unwrap();
+        let old_marker = jsp::join(&[&generated_dir(&qdir, "k1"), &marker_name(slot, &marker_tag(&hand_marker_id(&old)))]);
+        assert!(std::path::Path::new(&old_marker).exists());
+
+        // --update: the new hand file lands, then (before its prune runs) a
+        // parallel generate-image regenerates the reused slot for it.
+        let mut new = new_hand(&cwd, &payload);
+        new.insert("id".into(), json!("feedfacecafebeef"));
+        let target = hand_file(&qdir, "k1");
+        write_atomic(&target, &json_compact(&Value::Object(new.clone()))).unwrap();
+        assert_eq!(record_generated(&cwd, slot).unwrap(), vec!["k1".to_string()]);
+        let new_marker = jsp::join(&[&generated_dir(&qdir, "k1"), &marker_name(slot, "feedfacecafebeef")]);
+        assert!(!same_path(&old_marker, &new_marker), "one hand's marker must never share a path with another's");
+        // The old hand's marker is still there when the prune starts.
+        assert!(std::path::Path::new(&old_marker).exists());
+
+        // The prune half of write_hand: it removes the old hand's marker and
+        // keeps the new one.
+        write_hand(&qdir, "k1", &new).unwrap();
+        assert!(!std::path::Path::new(&old_marker).exists());
+        assert!(std::path::Path::new(&new_marker).exists());
+        assert_eq!(read_hand(&qdir, "k1").unwrap().get("generated"), Some(&json!([slot])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_untagged_markers_are_judged_by_content() {
+        let dir = temp_project("marker-legacy");
+        let cwd = dir.to_string_lossy().into_owned();
+        let qdir = jsp::join(&[&cwd, ".impeccable", "questions"]);
+        let (a, b) = (".impeccable/mocks/decision/a.png", ".impeccable/mocks/decision/b.png");
+        let mut hand = new_hand(&cwd, &json!({ "options": [{ "id": "a", "comp": a }, { "id": "b", "comp": b }] }));
+        hand.insert("id".into(), json!("0011223344556677"));
+        write_hand(&qdir, "k1", &hand).unwrap();
+        let gdir = generated_dir(&qdir, "k1");
+        std::fs::create_dir_all(&gdir).unwrap();
+        let legacy = |slot: &str| jsp::join(&[&gdir, &format!("{}.json", hand_digest(&Value::String(slot.into())))]);
+        std::fs::write(legacy(a), json!({ "slot": a, "hand": "0011223344556677" }).to_string()).unwrap();
+        std::fs::write(legacy(b), json!({ "slot": b, "hand": "ffffffffffffffff" }).to_string()).unwrap();
+        // The legacy marker whose content names this hand counts; the other does not.
+        assert_eq!(read_hand(&qdir, "k1").unwrap().get("generated"), Some(&json!([a])));
+        // Rewriting the same hand keeps its legacy marker and prunes the other's.
+        write_hand(&qdir, "k1", &hand).unwrap();
+        assert!(std::path::Path::new(&legacy(a)).exists());
+        assert!(!std::path::Path::new(&legacy(b)).exists());
+        // A legacy hand file (no id) matches legacy markers on its digest.
+        let mut old = hand.clone();
+        old.remove("id");
+        let digest = old.get("digest").and_then(Value::as_str).unwrap().to_string();
+        write_hand(&qdir, "k1", &old).unwrap();
+        assert!(!std::path::Path::new(&legacy(a)).exists());
+        std::fs::write(legacy(b), json!({ "slot": b, "digest": digest }).to_string()).unwrap();
+        assert_eq!(read_hand(&qdir, "k1").unwrap().get("generated"), Some(&json!([b])));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
