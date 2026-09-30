@@ -375,3 +375,48 @@ fn large_images_contradict_a_spec_without_raster_regions_but_logos_do_not() {
     fs::write(f.project.join("assets/logo.png"), logo).unwrap();
     capture_with(&f, &format!("{PAGE}<img src=\"assets/logo.png\" style=\"position:absolute;right:8px;top:8px;width:16px;height:16px\">")).unwrap();
 }
+
+#[test]
+fn coverage_counts_only_the_image_area_that_is_painted() {
+    if !browser_available() {
+        return;
+    }
+    let f = Fixture::new();
+    fs::create_dir_all(f.project.join("assets")).unwrap();
+    let big = png_io::encode_png(&raster::create_image(240, 160, [30, 90, 200, 255]), &[]).unwrap();
+    fs::write(f.project.join("assets/big.png"), big).unwrap();
+    let wide = png_io::encode_png(&raster::create_image(240, 8, [30, 90, 200, 255]), &[]).unwrap();
+    fs::write(f.project.join("assets/wide.png"), wide).unwrap();
+    let icon = png_io::encode_png(&raster::create_image(16, 16, [30, 90, 200, 255]), &[]).unwrap();
+    fs::write(f.project.join("assets/icon.png"), icon).unwrap();
+    let full = "style=\"display:block;width:240px;height:160px\"";
+    // Clipped to a 12px strip by its overflow parent: 7.5% painted.
+    capture_with(&f, &format!("{PAGE}<div style=\"position:absolute;left:0;top:140px;width:240px;height:12px;overflow:hidden\"><img src=\"assets/big.png\" {full}></div>")).unwrap();
+    // An absolutely positioned image escapes a static overflow wrapper, so it is not clipped by it.
+    let e = capture_with(&f, &format!("{PAGE}<div style=\"width:10px;height:10px;overflow:hidden\"><img src=\"assets/big.png\" style=\"position:absolute;left:0;top:0;width:240px;height:160px\"></div>")).unwrap_err();
+    assert!(e.contains("images cover 100%"), "{e}");
+    // Under a transparent ancestor, or hidden, it paints nothing.
+    capture_with(&f, &format!("{PAGE}<div style=\"opacity:0\"><img src=\"assets/big.png\" {full}></div>")).unwrap();
+    capture_with(&f, &format!("{PAGE}<img src=\"assets/big.png\" style=\"visibility:hidden;position:absolute;left:0;top:0;width:240px;height:160px\">")).unwrap();
+    // Letterboxed: only the picture counts, not its box.
+    capture_with(&f, &format!("{PAGE}<img src=\"assets/wide.png\" style=\"position:absolute;left:0;top:0;width:240px;height:160px;object-fit:contain\">")).unwrap();
+    capture_with(&f, &format!("{PAGE}<img src=\"assets/icon.png\" style=\"position:absolute;left:0;top:0;width:240px;height:160px;object-fit:scale-down\">")).unwrap();
+    // Stretched (the default fill), the same picture covers the frame.
+    let e = capture_with(&f, &format!("{PAGE}<img src=\"assets/wide.png\" style=\"position:absolute;left:0;top:0;width:240px;height:160px\">")).unwrap_err();
+    assert!(e.contains("images cover 100%"), "{e}");
+}
+
+#[test]
+fn svg_fragment_masks_and_patterns_are_code_not_raster() {
+    if !browser_available() {
+        return;
+    }
+    let f = Fixture::new();
+    let svg = "<svg width=\"0\" height=\"0\" style=\"position:absolute\"><defs>\
+        <mask id=\"m\" maskContentUnits=\"objectBoundingBox\"><rect width=\"1\" height=\"1\" fill=\"white\"/></mask>\
+        <pattern id=\"p\" width=\"8\" height=\"8\" patternUnits=\"userSpaceOnUse\"><rect width=\"4\" height=\"4\" fill=\"#1e5ac8\"/></pattern></defs></svg>";
+    let masked = format!("{svg}<div style=\"position:absolute;left:0;top:0;width:240px;height:160px;background:#181c24;mask-image:url(#m);-webkit-mask-image:url(#m)\"></div>");
+    capture_with(&f, &format!("{PAGE}{masked}")).unwrap();
+    let patterned = format!("{svg}<svg style=\"position:absolute;left:0;top:0\" width=\"240\" height=\"160\"><rect width=\"240\" height=\"160\" fill=\"url(#p)\"/></svg>");
+    capture_with(&f, &format!("{PAGE}{patterned}")).unwrap();
+}

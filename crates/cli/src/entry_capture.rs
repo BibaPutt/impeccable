@@ -226,14 +226,8 @@ fn capture_text_only(
             continue;
         }
         let bytes = raster.bytes(&name).ok_or_else(|| format!("{name} is not in the frozen inputs"))?;
-        // A declared dependency is part of the reviewed page, so check it up front.
-        // Under the inventory, only what the page actually loads is checked (below),
-        // so an unused backup of the comp does not block an honest page.
-        if declared.is_some() {
-            if let Some(reason) = forbidden_content(&name, bytes, &forbidden) {
-                return Err(format!("text-only first viewport declares {name}, which {reason}. The page must draw the first viewport in code, not show the approved reference."));
-            }
-        }
+        // Served files are checked when the page loads them (below), under either
+        // policy: a file that never reaches the page cannot show the reference.
         files.insert(name, bytes.to_vec());
     }
     let page = Arc::new(PageSnapshot::from_pinned(request.artifact.clone(), files)?);
