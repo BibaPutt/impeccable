@@ -50,7 +50,7 @@ Present a second manifest at `.impeccable/review/hero.json`. You write this one,
 }
 ```
 
-- `schemaVersion` is 2. Version 3 is the plan review packet and requires stage `components`, and its `codeRegions`, `specSha256` and `reviewGroup` fields are refused here.
+- `schemaVersion` is 2. Version 3 is the plan review packet and requires stage `components`. `codeRegions` and `specSha256` exist only in version 3 and are refused here. `reviewGroup` is refused too: version 3 rejects it, and any other version accepts it only on a page preview in a `components`-stage manifest, never in a hero manifest.
 - `comp.path` is the `comp` value in `.impeccable/build/spec.json`, and `width` and `height` are that PNG's pixel size.
 - Exactly one component, with `box` exactly `{"x": 0, "y": 0, "w": 1, "h": 1}` and `name`, `medium` and `note` as strings.
 - `preview.path` is the page entry the build gates (`artifact` in `.impeccable/build/state.json`).
