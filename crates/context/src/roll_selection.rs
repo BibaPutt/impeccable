@@ -475,6 +475,49 @@ mod tests {
         }
     }
 
+    // A late re-roll whose unseen graphic concepts cannot fill the quota deals
+    // every unseen one first, then tops up with families not yet in the hand.
+    #[test]
+    fn a_short_tier_deals_unseen_first_and_tops_up_across_families() {
+        let open: Vec<Value> = parity()["concepts"].as_array().unwrap().clone();
+        let graphic: Vec<Value> = open
+            .iter()
+            .filter(|c| {
+                s(c, "status") == Some("approved")
+                    && s(c, "wellTier") == Some("graphic")
+                    && mode_allows(c, "operate")
+                    && matches!(s(c, "strength"), Some("world") | Some("dual"))
+                    && review_field(c, "breadth").and_then(|b| b.as_str()) != Some("niche")
+            })
+            .cloned()
+            .collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut short_rounds = 0;
+        for round in 0..6 {
+            let sel = select_approved_challengers("direction", "chain", round, Some("operate"), &open).unwrap();
+            let dealt: Vec<Value> = sel.picks.iter().filter(|p| s(p, "wellTier") == Some("graphic")).cloned().collect();
+            let unseen: Vec<&Value> = graphic.iter().filter(|c| !seen.contains(s(c, "id").unwrap())).collect();
+            let dealt_ids: HashSet<String> = ids(&dealt).into_iter().collect();
+            if !unseen.is_empty() && unseen.len() < 5 && dealt.len() == 5 {
+                short_rounds += 1;
+                for c in &unseen {
+                    assert!(dealt_ids.contains(s(c, "id").unwrap()), "round {round} skipped unseen {}", s(c, "id").unwrap());
+                }
+                let taken: Vec<Value> = unseen.iter().map(|c| c["familyId"].clone()).collect();
+                let top_up: Vec<&Value> = dealt.iter().filter(|p| !unseen.iter().any(|c| s(c, "id") == s(p, "id"))).collect();
+                let families_left = graphic.iter().map(|c| c["familyId"].clone()).filter(|f| !taken.contains(f)).collect::<Vec<_>>();
+                if !families_left.is_empty() {
+                    assert!(!taken.contains(&top_up[0]["familyId"]), "round {round} top-up reused a taken family");
+                }
+            }
+            if unseen.is_empty() {
+                break;
+            }
+            seen.extend(dealt_ids);
+        }
+        assert!(short_rounds > 0, "the chain never reached a short round");
+    }
+
     #[test]
     fn modes_without_a_quota_keep_two_per_tier() {
         let open: Vec<Value> = parity()["concepts"].as_array().unwrap().clone();
