@@ -107,7 +107,7 @@ fn print_answer(io: &mut Io, raw: &str) {
         io.out("CHOSEN CARD: open the chosen world's board and hero images now, before any code. When your harness only reads files, or runs sandboxed, download them INTO the workspace and open the relative path; a sandboxed viewer rejects absolute paths outside it. They set the craft bar the build must reach.\n");
     }
     if truthy("comp") && is_comp_round_comp(&a.get("comp").map(js_str).unwrap_or_default()) {
-        io.out("APPROVED COMP: the user picked this composition in the comp round, so it is the approved comp. Set \"approved\": true in its prompt sidecar (<comp>.json), record its path in the surface brief, then close the comps phase with build-phase advance. Build from it as it stands; never regenerate it.\n");
+        io.out("APPROVED COMP: the user picked this composition in the comp round, so it is the approved comp. Set \"approved\": true in its prompt sidecar, the image's full file name plus .json (a.png gets a.png.json), record its path in the surface brief, then close the comps phase with build-phase advance. Build from it as it stands; never regenerate it.\n");
     } else if truthy("comp") {
         io.out("CHOSEN COMP: the decision comp at that path is compositional option one. On a comp-led build the comp round adds two variations beside it; on a code-led build it returns at the finish review as the critique reference. Never regenerate it from scratch.\n");
     }
@@ -444,12 +444,12 @@ fn visualize_ref(env: &Env, cwd: &str) -> String {
 /// the decision round's comps are about to be written.
 fn visualize_next_line(env: &Env, cwd: &str) -> String {
     format!(
-        "NEXT read {} now, before writing any decision comp prompt; its comp rules govern every card's image. Then generate each declared comp into its slot, lead first, and record the exact prompt in its sidecar (<comp>.json).\n",
+        "NEXT read {} now, before writing any decision comp prompt; its comp rules govern every card's image. Then generate each declared comp into its slot, lead first, and record the exact prompt in its sidecar, the image's full file name plus .json (a.png gets a.png.json).\n",
         visualize_ref(env, cwd)
     )
 }
 
-/// This hand's landed comps without a `<comp>.json` prompt sidecar.
+/// This hand's landed comps without a prompt sidecar (`a.png` -> `a.png.json`).
 fn comps_missing_sidecar(cwd: &str, comps: &[String], hand: Option<&Map<String, Value>>) -> Vec<String> {
     comps
         .iter()
@@ -470,7 +470,7 @@ fn stale_comps_line(env: &Env, cwd: &str, stale: &[String]) -> String {
 /// The `--wait` backstop: names every landed decision comp with no sidecar.
 fn sidecar_missing_line(env: &Env, cwd: &str, missing: &[String]) -> String {
     format!(
-        "COMP SIDECAR MISSING: {} landed with no prompt sidecar. Every decision comp records the exact prompt that produced it in <comp>.json ({{\"prompt\": \"...\"}}; generate-image writes it itself, a harness image tool does not), and that prompt is written under the comp rules in {}. Write each missing sidecar now, and read that file before the next comp prompt if you have not.\n",
+        "COMP SIDECAR MISSING: {} landed with no prompt sidecar. Every decision comp records the exact prompt that produced it in its sidecar, the image's full file name plus .json (a.png gets a.png.json), as {{\"prompt\": \"...\"}} (generate-image writes it itself, a harness image tool does not), and that prompt is written under the comp rules in {}. Write each missing sidecar now, and read that file before the next comp prompt if you have not.\n",
         missing.join(", "),
         visualize_ref(env, cwd)
     )
@@ -2117,7 +2117,7 @@ mod tests {
         let env = Env::from([("IMPECCABLE_SKILL_DIR".into(), "/skill".into())]);
         let line = visualize_next_line(&env, "/proj").replace('\\', "/");
         assert!(line.starts_with("NEXT read /skill/reference/visualize.md now, before writing any decision comp prompt;"), "{line}");
-        assert!(line.ends_with("(<comp>.json).\n"));
+        assert!(line.ends_with("the image's full file name plus .json (a.png gets a.png.json).\n"));
     }
 
     #[test]

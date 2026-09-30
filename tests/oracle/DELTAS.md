@@ -277,3 +277,11 @@ Generated slots and hand-write failures (same branch): a deterministic generator
 - `genimg-fake-marks-hand-slot`: the marker file is now `k1.generated/bc804e5cae3cb360-0123456789abcdef.json` where it was `k1.generated/bc804e5cae3cb360.json`. Its content, stdout, stderr and exit are unchanged.
 
 The interleaving itself is covered by Rust tests in `crates/context/src/serve_question.rs`, not the oracle, since it needs two writers.
+
+## Recorded 2026-09-30: sidecar name spelled out
+
+The decision-comp directives said a comp's prompt goes in `<comp>.json`, which an agent read as the comp's name without its extension (`assigned.json`). The engine checks the image's full file name plus `.json` (`a.png.json`), so the wording now says so: `its sidecar, the image's full file name plus .json (a.png gets a.png.json)`. Only that phrase moved in each golden; exit status, files and every other line are unchanged.
+
+- `question-update-comps-next`, `question-wait-flip`: the `NEXT read ... visualize.md` line ends with the new phrase in place of `(<comp>.json)`.
+- `question-wait-comp-sidecar-missing`, `question-wait-answer-comp-sidecar-missing`: `COMP SIDECAR MISSING` names the sidecar the same way, followed by `as {"prompt": "..."} (generate-image writes it itself, a harness image tool does not)`.
+- `question-wait-answer-comp-round`: `APPROVED COMP` says `Set "approved": true in its prompt sidecar, the image's full file name plus .json (a.png gets a.png.json)`.
