@@ -224,7 +224,15 @@ pub fn filter_by_text(
     candidates
         .iter()
         .filter(|c| {
-            let body = lines[c.start_line..=c.end_line.unwrap_or(c.start_line)].join(" ");
+            // An unclosed element's text runs to the next opener of its tag.
+            let end = c.end_line.unwrap_or_else(|| {
+                let tag = opener_tag(&lines[c.start_line]);
+                (c.start_line + 1..lines.len())
+                    .find(|&i| opener_tag(&lines[i]) == tag)
+                    .unwrap_or(lines.len())
+                    - 1
+            });
+            let body = lines[c.start_line..=end].join(" ");
             let inner = TAG_RE.replace_all(&body, " ");
             let inner = JSX_EXPR_RE.replace_all(&inner, " ");
             let inner = inner.to_lowercase();
@@ -276,12 +284,17 @@ pub fn find_closing_line(lines: &[String], start: usize) -> Option<usize> {
     let mut in_tag = false;
     let mut braces = 0usize;
     let mut quote: Option<char> = None;
+    // A closing tag whose `>` sits on the next line (`</section` / `>`).
+    let mut pending_close = false;
     for (i, line) in lines.iter().enumerate().skip(start) {
         let chars: Vec<char> = line.chars().collect();
+        if std::mem::take(&mut pending_close)
+            && chars.iter().find(|c| !is_js_whitespace(**c)) == Some(&'>')
+        {
+            depth -= 1;
+        }
         for (j, &c) in chars.iter().enumerate() {
             if in_tag {
-                // Quotes only count outside `{...}`: an apostrophe in an
-                // expression's comment or text is not a string delimiter.
                 if let Some(q) = quote {
                     if c == q {
                         quote = None;
@@ -290,8 +303,20 @@ pub fn find_closing_line(lines: &[String], start: usize) -> Option<usize> {
                     braces += 1;
                 } else if c == '}' {
                     braces = braces.saturating_sub(1);
-                } else if braces == 0 && (c == '"' || c == '\'') {
-                    quote = Some(c);
+                } else if c == '"' || c == '\'' || c == '`' {
+                    // Outside `{...}` a quote opens an attribute value. Inside,
+                    // it opens a JS string only when that string closes on this
+                    // line and is no contraction: an apostrophe in a comment or
+                    // in text is not a delimiter.
+                    let opens = if braces == 0 {
+                        c != '`'
+                    } else {
+                        chars[j + 1..].contains(&c)
+                            && !(c == '\'' && j > 0 && chars[j - 1].is_alphanumeric())
+                    };
+                    if opens {
+                        quote = Some(c);
+                    }
                 } else if braces == 0 && c == '>' {
                     in_tag = false;
                     if j > 0 && chars[j - 1] == '/' {
@@ -302,8 +327,10 @@ pub fn find_closing_line(lines: &[String], start: usize) -> Option<usize> {
                 let rest = &chars[j + 1..];
                 if rest.first() == Some(&'/') && rest[1..].starts_with(&name) {
                     let after = &rest[1 + name.len()..];
-                    if after.iter().find(|c| !is_js_whitespace(**c)) == Some(&'>') {
-                        depth -= 1;
+                    match after.iter().find(|c| !is_js_whitespace(**c)) {
+                        Some('>') => depth -= 1,
+                        None => pending_close = true,
+                        _ => {}
                     }
                 } else if rest.starts_with(&name) {
                     // JS: `(?=[\s/>]|$)`, so `<legend` does not match `<legendary`.
@@ -449,11 +476,14 @@ mod tests {
             // `>` inside a prop expression, then inside a quoted value.
             ("<input onChange={(e) => set(e.target.value)} />\n<p>a</p>\n<p>b</p>\n", Some(0)),
             ("<input className=\"[&>svg]:size-4\" />\n<p>a</p>\n<p>b</p>\n", Some(0)),
-            // An apostrophe inside a prop expression is not a quote.
+            // An apostrophe inside a prop expression is not a quote, a string is.
             ("<button onClick={() => {\n  // don't resubmit\n  go();\n}}>\n  Go\n</button>\n<p>a</p>\n", Some(5)),
+            ("<Field label={\"{\"} />\n<p>a</p>\n<p>b</p>\n", Some(0)),
             // Nested same-name tags, and a sibling opened on the closing line.
             ("<section>\n  <section>\n    x\n  </section>\n</section>\n<p>a</p>\n", Some(4)),
             ("<a>x</a> and <a>y\nz</a>\n<p>a</p>\n", Some(1)),
+            // A closing tag split before its `>`.
+            ("<section>\n  x\n</section\n>\n<p>a</p>\n", Some(3)),
             // Never closed: no end line rather than a guessed one.
             ("<img class=\"hero\">\n<p>a</p>\n<p>b</p>\n", None),
         ];
@@ -461,5 +491,15 @@ mod tests {
             let lines: Vec<String> = src.lines().map(String::from).collect();
             assert_eq!(find_closing_line(&lines, 0), end, "{src}");
         }
+    }
+
+    #[test]
+    fn text_filter_reads_an_unclosed_element_up_to_its_next_sibling() {
+        let src = "<p class=\"n\">Closed sibling</p>\n<p class=\"n\">\n  Unclosed text here\n<p class=\"n\">Third one</p>\n";
+        let lines: Vec<String> = src.lines().map(String::from).collect();
+        let candidates = find_all_elements(&lines, "class=\"n\"", Some("p"));
+        let picked = filter_by_text(&candidates, &lines, "Unclosed text here");
+        assert_eq!(picked.len(), 1);
+        assert_eq!((picked[0].start_line, picked[0].end_line), (1, None));
     }
 }
