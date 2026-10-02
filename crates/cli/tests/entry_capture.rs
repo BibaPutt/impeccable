@@ -241,6 +241,32 @@ fn honest_raster_page_with_the_comp_in_the_project_still_passes() {
     }
 }
 
+/// Mobile reflows away from the comp, so a declared plate counts nowhere there,
+/// whatever its query string and whether it paints as an image or a pseudo-element.
+#[test]
+fn mobile_excludes_declared_plates_however_they_are_referenced() {
+    if !browser_available() {
+        return;
+    }
+    let f = Fixture::visible();
+    let big = "<style>@media (max-width:500px){img,.art::before{width:80vw;height:80vw}}</style>";
+    for page in [
+        format!("{STYLE}{big}<img src='assets/art.png?v=2'>"),
+        format!("{STYLE}{big}<div class=art></div><style>.art::before{{content:'';position:absolute;left:10vw;top:10vw;width:40vw;height:40vw;background:url(assets/art.png?v=2) 0 0/100% 100%}}</style>"),
+    ] {
+        fs::write(f.0.join("index.html"), &page).unwrap();
+        let captured = CdpEntryRenderer.capture_entry(&f.request(EntryStage::Responsive)).unwrap();
+        let share = captured.evidence().report["frameProofs"]["mobile"]["rasterCoverage"]["share"].as_f64().unwrap();
+        assert!(share < 0.01, "{page}: {share}");
+    }
+    // An undeclared image of the same size still counts on mobile.
+    let other = png_io::encode_png(&raster::create_image(32, 32, [20, 90, 200, 255]), &[]).unwrap();
+    fs::write(f.0.join("assets/other.png"), other).unwrap();
+    f.page(&format!("{big}<style>.m{{display:none}}@media (max-width:500px){{.m{{display:block}}}}</style><img class=m src='assets/other.png' style='left:0;top:60vw;width:80vw;height:80vw'>"));
+    let e = refusal(&CdpEntryRenderer, &f, EntryStage::Responsive);
+    assert!(e.contains("mobile raster capture refused") && e.contains("outside the declared raster regions"), "{e}");
+}
+
 #[test]
 fn host_capture_service_refuses_a_raster_page_that_shows_the_comp() {
     if !browser_available() {

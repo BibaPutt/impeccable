@@ -176,21 +176,6 @@ impl CdpEntryRenderer {
             // that failed because the comp was withheld says why.
             check_requests(name, &snapshot, request, &forbidden)?;
             let mut regions = captured?;
-            let coverage = regions
-                .first()
-                .map(|r| r.receipt["rasterCoverage"].clone())
-                .filter(|c| c["share"].is_number())
-                .ok_or("raster coverage was not measured")?;
-            for region in &mut regions {
-                if let Some(receipt) = region.receipt.as_object_mut() {
-                    receipt.remove("rasterCoverage");
-                }
-            }
-            let share = coverage["share"].as_f64().unwrap_or(1.);
-            if share >= TEXT_ONLY_RASTER_SHARE_MAX {
-                return Err(format!("{name} raster capture refused: images outside the declared raster regions cover {}% of the viewport (limit {}%): {}. The spec declares every raster in the first viewport as a raster region: declare this image as one (comp-spec --regions), or remove it and draw that area in code.", (share * 100.).round(), (TEXT_ONLY_RASTER_SHARE_MAX * 100.) as u32, largest_images(&coverage)));
-            }
-            evidence.report["frameProofs"][name] = json!({"rasterCoverage": coverage});
             if regions.iter().any(|r| {
                 r.receipt["stableCapture"] != true || r.receipt["batchStabilityVerified"] != true
             }) {
@@ -217,6 +202,23 @@ impl CdpEntryRenderer {
                     "{name} native capture did not retain a stable bound document: {details}"
                 ));
             }
+            let coverage = regions
+                .first()
+                .map(|r| r.receipt["rasterCoverage"].clone())
+                .ok_or("raster coverage was not measured")?;
+            if !coverage["share"].is_number() {
+                return Err(format!("{name} raster coverage was not measured: {}", coverage["unavailable"].as_str().unwrap_or("no measurement")));
+            }
+            for region in &mut regions {
+                if let Some(receipt) = region.receipt.as_object_mut() {
+                    receipt.remove("rasterCoverage");
+                }
+            }
+            let share = coverage["share"].as_f64().unwrap_or(1.);
+            if share >= TEXT_ONLY_RASTER_SHARE_MAX {
+                return Err(format!("{name} raster capture refused: images outside the declared raster regions cover {}% of the viewport (limit {}%): {}. The spec declares every raster in the first viewport as a raster region: declare this image as one (comp-spec --regions), or remove it and draw that area in code.", (share * 100.).round(), (TEXT_ONLY_RASTER_SHARE_MAX * 100.) as u32, largest_images(&coverage)));
+            }
+            evidence.report["frameProofs"][name] = json!({"rasterCoverage": coverage});
             let png = regions[0]
                 .images
                 .iter()

@@ -21,7 +21,10 @@
   const items = [];
   const page = location.href.split('#')[0];
   const boxes = (exclude && exclude.boxes) || [];
-  const plates = new Set(((exclude && exclude.paths) || []).map(p => new URL(p, location.origin + '/').href));
+  // A resource is named by origin and path: the snapshot server ignores the
+  // query string, and a fragment never reaches it, so `art.png?v=2` is the plate.
+  const resource = u => u.origin + u.pathname;
+  const plates = new Set(((exclude && exclude.paths) || []).map(p => resource(new URL(p, location.origin + '/'))));
   const outside = (x, y) => !boxes.some(b => x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h);
   // The images a value references that are not fragments of this document.
   // Chromium may report url(#id) resolved against the page URL. An unparsable
@@ -35,7 +38,7 @@
       try {
         const u = new URL(ref, page);
         if (u.hash && u.href.split('#')[0] === page) continue;
-        out.push(u.href);
+        out.push(resource(u));
       } catch { out.push(null); }
     }
     return out;
@@ -121,12 +124,12 @@
     const r = el.getBoundingClientRect();
     const tag = el.tagName.toLowerCase();
     const at = (rect, what, srcs) => mark(el.parentElement, s.position, rect, what, srcs);
-    const src = v => { try { return v ? [new URL(v, page).href] : []; } catch { return [null]; } };
+    const src = v => { try { return v ? [resource(new URL(v, page))] : []; } catch { return [null]; } };
     if (tag === 'img' || tag === 'video' || (tag === 'input' && el.type === 'image')) at(picture(el, s, r), name(el), src(el.currentSrc || el.src));
     if (tag === 'image') at(box(r), name(el), src(el.href && el.href.baseVal));
     if (url(s.backgroundImage)) at(background(s, r), name(el) + ' background', refs(s.backgroundImage));
-    if (url(s.borderImageSource) || url(s.maskImage) || url(s.webkitMaskImage)) at(box(r), name(el) + ' border/mask image');
-    if (url(s.listStyleImage) && s.display === 'list-item') at(box(r), name(el) + ' list marker');
+    if (url(s.borderImageSource) || url(s.maskImage) || url(s.webkitMaskImage)) at(box(r), name(el) + ' border/mask image', [...refs(s.borderImageSource), ...refs(s.maskImage), ...refs(s.webkitMaskImage)]);
+    if (url(s.listStyleImage) && s.display === 'list-item') at(box(r), name(el) + ' list marker', refs(s.listStyleImage));
     for (const p of ['::before', '::after']) {
       const ps = getComputedStyle(el, p);
       if (!ps || ps.content === 'none' || ps.content === 'normal' || ps.display === 'none' || ps.visibility !== 'visible' || parseFloat(ps.opacity) === 0) continue;
@@ -136,9 +139,10 @@
       // without one, count the host box. Its clipping chain starts at the host.
       const mode = ps.position === 'fixed' || ps.position === 'absolute' ? ps.position : 'static';
       const w = px(ps.width), h = px(ps.height);
-      if (w == null || h == null) { mark(el, mode, box(r), name(el) + p); continue; }
+      const srcs = [ps.content, ps.backgroundImage, ps.borderImageSource, ps.maskImage, ps.webkitMaskImage].flatMap(refs);
+      if (w == null || h == null) { mark(el, mode, box(r), name(el) + p, srcs); continue; }
       const left = mode === 'fixed' ? (px(ps.left) ?? 0) : r.left, top = mode === 'fixed' ? (px(ps.top) ?? 0) : r.top;
-      mark(el, mode, { left, top, right: left + w, bottom: top + h }, name(el) + p);
+      mark(el, mode, { left, top, right: left + w, bottom: top + h }, name(el) + p, srcs);
     }
   }
   const covered = grid.reduce((n, v) => n + v, 0);

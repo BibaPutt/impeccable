@@ -98,13 +98,6 @@ impl AssetRenderer for CdpAssetRenderer {
                 &mut capture,
                 r#"Promise.race([(async()=>{await document.fonts.ready;await Promise.all([...document.images].filter(i=>{const b=i.getBoundingClientRect();return b.width>0&&b.height>0&&b.x<innerWidth&&b.y<innerHeight&&b.right>0&&b.bottom>0;}).map(i=>i.decode().catch(()=>{})));return true;})(),new Promise((_,reject)=>setTimeout(()=>reject(Error('capture resources did not settle')),5000))])"#,
             )?;
-            let coverage = match &self.raster_coverage {
-                Some(exclude) => Some(eval(
-                    &mut capture,
-                    &format!("({})({exclude})", include_str!("raster_coverage.js")),
-                )?),
-                None => None,
-            };
             let key = format!(
                 "__impeccable_capture_{}",
                 SystemTime::now()
@@ -199,6 +192,16 @@ impl AssetRenderer for CdpAssetRenderer {
                     "(()=>{{globalThis[{key}]?.restore();delete globalThis[{key}];return true;}})()"
                 ),
             );
+            // Measured on the restored page and bound to the graded frame: the
+            // viewport must show the baseline pixels before and after, so a page
+            // that changes later cannot report an earlier, smaller coverage.
+            let coverage = match (&self.raster_coverage, &result) {
+                (Some(exclude), Ok(captures)) => Some(
+                    coverage_on_baseline(&mut capture, &requests[0], exclude, captures)
+                        .unwrap_or_else(|reason| json!({"unavailable": reason})),
+                ),
+                _ => None,
+            };
             drop(capture);
             page.close();
             result.map(|captures| (captures, coverage))
@@ -221,6 +224,28 @@ impl AssetRenderer for CdpAssetRenderer {
                 .collect()
         })
     }
+}
+fn coverage_on_baseline(
+    page: &mut CapturePage<'_, '_>,
+    r: &AssetCaptureRequest,
+    exclude: &Value,
+    captures: &[AssetCapture],
+) -> Result<Value, String> {
+    let baseline = captures
+        .iter()
+        .flat_map(|c| c.images.iter())
+        .find(|i| i.name == "baseline.png")
+        .ok_or("no settled baseline frame")?;
+    let baseline = png_io::decode_png(&baseline.png)
+        .map_err(|e| format!("baseline decode: {e:?}"))?
+        .image;
+    let (_, before) = screenshot(page, r)?;
+    let coverage = eval(page, &format!("({})({exclude})", include_str!("raster_coverage.js")))?;
+    let (_, after) = screenshot(page, r)?;
+    if before.data != baseline.data || after.data != baseline.data {
+        return Err("the page no longer shows the captured frame".into());
+    }
+    Ok(coverage)
 }
 struct CapturePage<'p, 'b> {
     page: &'p mut Page<'b>,
