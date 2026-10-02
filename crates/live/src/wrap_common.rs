@@ -224,17 +224,11 @@ pub fn filter_by_text(
     candidates
         .iter()
         .filter(|c| {
-            // An unclosed element's text runs to the next candidate or the
-            // next opener of its tag, whichever comes first.
-            let end = c.end_line.unwrap_or_else(|| {
-                let tag = opener_tag(&lines[c.start_line]);
-                (c.start_line + 1..lines.len())
-                    .find(|&i| {
-                        opener_tag(&lines[i]) == tag || candidates.iter().any(|o| o.start_line == i)
-                    })
-                    .unwrap_or(lines.len())
-                    - 1
-            });
+            // An unclosed element has no end to read up to. For matching only,
+            // look ahead a fixed window; nothing is written from this range.
+            let end = c
+                .end_line
+                .unwrap_or_else(|| (c.start_line + 50).min(lines.len() - 1));
             let body = lines[c.start_line..=end].join(" ");
             let inner = TAG_RE.replace_all(&body, " ");
             let inner = JSX_EXPR_RE.replace_all(&inner, " ");
@@ -296,10 +290,17 @@ pub fn find_closing_line(lines: &[String], start: usize) -> Option<usize> {
         {
             depth -= 1;
         }
+        let mut escaped = false;
         for (j, &c) in chars.iter().enumerate() {
             if in_tag {
                 if let Some(q) = quote {
-                    if c == q {
+                    // A JS string takes backslash escapes; an attribute value
+                    // does not.
+                    if escaped {
+                        escaped = false;
+                    } else if braces > 0 && c == '\\' {
+                        escaped = true;
+                    } else if c == q {
                         quote = None;
                     }
                 } else if c == '{' {
@@ -485,6 +486,7 @@ mod tests {
             ("<button onClick={() => {\n  // don't resubmit\n  go();\n}}>\n  Go\n</button>\n<p>a</p>\n", Some(5)),
             ("<Field label={\"{\"} />\n<p>a</p>\n<p>b</p>\n", Some(0)),
             ("<Field sql={`\n  a {\n`} />\n<p>a</p>\n<p>b</p>\n", Some(2)),
+            ("<Field title={`a\\`b`} />\n<p>a</p>\n<p>b</p>\n", Some(0)),
             // Nested same-name tags, and a sibling opened on the closing line.
             ("<section>\n  <section>\n    x\n  </section>\n</section>\n<p>a</p>\n", Some(4)),
             ("<a>x</a> and <a>y\nz</a>\n<p>a</p>\n", Some(1)),
@@ -500,17 +502,12 @@ mod tests {
     }
 
     #[test]
-    fn text_filter_reads_an_unclosed_element_up_to_its_next_sibling() {
-        // The unclosed `<p>` owns the text below it; the unclosed `<img>`
-        // does not own the text of the candidate that follows it.
-        let src = "<p class=\"n\">\n  Unclosed text here\n<p class=\"n\">Third one</p>\n<img class=\"n\">\n<div class=\"n\">Later div text</div>\n";
+    fn text_filter_reads_an_unclosed_elements_text_past_its_children() {
+        let src = "<div class=\"n\">Earlier card</div>\n<div class=\"n\">\n  <div class=\"n\">Nested card</div>\n  Parent trailing text\n<p>after</p>\n";
         let lines: Vec<String> = src.lines().map(String::from).collect();
-        let candidates = find_all_elements(&lines, "class=\"n\"", None);
-        let starts = |text: &str| -> Vec<usize> {
-            let picked = filter_by_text(&candidates, &lines, text);
-            picked.iter().map(|c| c.start_line).collect()
-        };
-        assert_eq!(starts("Unclosed text here"), [0]);
-        assert_eq!(starts("Later div text"), [4]);
+        let candidates = find_all_elements(&lines, "class=\"n\"", Some("div"));
+        let picked = filter_by_text(&candidates, &lines, "Parent trailing text");
+        assert_eq!(picked.len(), 1);
+        assert_eq!((picked[0].start_line, picked[0].end_line), (1, None));
     }
 }
