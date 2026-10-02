@@ -17,12 +17,21 @@ use std::{
 
 pub struct CdpAssetRenderer {
     env: HashMap<String, String>,
+    raster_coverage: Option<Value>,
 }
 impl CdpAssetRenderer {
     pub fn from_process_env() -> Self {
         Self {
             env: impeccable_common::process_env(),
+            raster_coverage: None,
         }
+    }
+    /// Also measure the share of the viewport images paint outside `exclude`
+    /// (`{boxes, paths}`, see `raster_coverage.js`) on the settled page, before
+    /// any intervention, and record it as `rasterCoverage` on every receipt.
+    pub fn measuring_raster_coverage(mut self, exclude: Value) -> Self {
+        self.raster_coverage = Some(exclude);
+        self
     }
 }
 impl AssetRenderer for CdpAssetRenderer {
@@ -89,6 +98,13 @@ impl AssetRenderer for CdpAssetRenderer {
                 &mut capture,
                 r#"Promise.race([(async()=>{await document.fonts.ready;await Promise.all([...document.images].filter(i=>{const b=i.getBoundingClientRect();return b.width>0&&b.height>0&&b.x<innerWidth&&b.y<innerHeight&&b.right>0&&b.bottom>0;}).map(i=>i.decode().catch(()=>{})));return true;})(),new Promise((_,reject)=>setTimeout(()=>reject(Error('capture resources did not settle')),5000))])"#,
             )?;
+            let coverage = match &self.raster_coverage {
+                Some(exclude) => Some(eval(
+                    &mut capture,
+                    &format!("({})({exclude})", include_str!("raster_coverage.js")),
+                )?),
+                None => None,
+            };
             let key = format!(
                 "__impeccable_capture_{}",
                 SystemTime::now()
@@ -185,13 +201,16 @@ impl AssetRenderer for CdpAssetRenderer {
             );
             drop(capture);
             page.close();
-            result
+            result.map(|captures| (captures, coverage))
         })();
         browser.close();
-        result.map(|captures| {
+        result.map(|(captures, coverage)| {
             captures
                 .into_iter()
                 .map(|mut capture| {
+                    if let Some(coverage) = &coverage {
+                        capture.receipt["rasterCoverage"] = coverage.clone();
+                    }
                     capture.receipt["browser"] = browser_version.clone();
                     capture.receipt["rasterization"] = json!("software");
                     capture.receipt["partialRaster"] = json!(false);
