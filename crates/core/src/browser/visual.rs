@@ -772,7 +772,19 @@ pub fn css_plan(dom: &dyn Dom, node: ElId, text_color: Option<&Rgba>) -> CssPlan
     if !bg_image.is_empty() && bg_image != "none" {
         if GRADIENT_RE.is_match(&bg_image) {
             if let Some(tc) = text_color {
-                let colors = parse_gradient_colors(Some(&bg_image));
+                // Over the element's own opaque background-color (no url() layer),
+                // stops composite before the worst is picked; with no such ground,
+                // a stop that paints nothing is skipped. Compared raw, `transparent`
+                // reads as black (issue #881).
+                let own = parse_rgb_or_any(&dom.style(node, "backgroundColor"))
+                    .filter(|c| c.alpha_or_one() >= 0.95 && !URL_RE.is_match(&bg_image));
+                let colors: Vec<Rgba> = parse_gradient_colors(Some(&bg_image))
+                    .into_iter()
+                    .filter_map(|c| match &own {
+                        Some(own) => blend_rgba(Some(&c), Some(own)),
+                        None => (c.alpha_or_one() > 0.05).then_some(c),
+                    })
+                    .collect();
                 if let Some(color) = pick_worst_contrast_color(tc, &colors) {
                     return CssPlan::Sample {
                         sample: json!({ "status": "sampled", "color": color, "method": "analytic-gradient" }),
@@ -1142,6 +1154,33 @@ mod tests {
         let nodes = stack_nodes(&d, p, 10.0, 10.0, 0.0).unwrap();
         assert_eq!(nodes[0].el, p);
         assert_eq!(nodes[0].kind, "css");
+    }
+
+    #[test]
+    fn gradient_stops_are_judged_as_they_paint() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let sec = d.add(Some(body), "section");
+        d.set_styles(sec, &[
+            ("backgroundImage", "radial-gradient(at 75% 42%, rgba(233, 231, 249, 0.72) 0px, rgba(0, 0, 0, 0) 58%), linear-gradient(rgb(242, 240, 250), rgba(0, 0, 0, 0) 75%)"),
+            ("backgroundColor", "rgb(255, 255, 255)"),
+        ]);
+        let text = rgba(24.0, 25.0, 28.0, 1.0);
+        let color = |d: &FakeDom| match css_plan(d, sec, Some(&text)) {
+            CssPlan::Sample { sample } => rgba_from_value(sample.get("color")).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        // Over the element's own white, a faded stop is white, never black.
+        assert_eq!(color(&d), rgba(239.0, 238.0, 251.0, 1.0));
+        // No ground of its own: the stops that paint nothing are skipped.
+        d.set_style(sec, "backgroundColor", "rgba(0, 0, 0, 0)");
+        assert_eq!(color(&d), rgba(233.0, 231.0, 249.0, 0.72));
+        // A url() layer sits between the gradient and the color: the color is not the ground.
+        d.set_styles(sec, &[
+            ("backgroundImage", "linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0)), url(\"a.png\")"),
+            ("backgroundColor", "rgb(255, 255, 255)"),
+        ]);
+        assert_eq!(color(&d), rgba(0.0, 0.0, 0.0, 0.5));
     }
 
     #[test]
