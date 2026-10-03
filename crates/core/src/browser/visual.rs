@@ -10,7 +10,7 @@ use super::dom::{
     closest_or_none, direct_text, pf0, safe_id, style_px, tag_lower, Dom, ElId, Rect,
 };
 use super::element_checks::parse_rgb_or_any;
-use crate::color::{contrast_ratio, parse_gradient_colors, parse_rgb, Rgba};
+use crate::color::{contrast_ratio, parse_gradient_colors, parse_rgb, split_top_level_commas, Rgba};
 use crate::constants::{SAFE_TAGS, WCAG_LARGE_BOLD_TEXT_PX, WCAG_LARGE_TEXT_PX};
 use crate::js::{self, math_max, math_min, math_round, number_to_string, parse_float, parse_int, to_fixed, WS};
 use crate::js_ext_a::{num_truthy, split_ws};
@@ -772,19 +772,35 @@ pub fn css_plan(dom: &dyn Dom, node: ElId, text_color: Option<&Rgba>) -> CssPlan
     if !bg_image.is_empty() && bg_image != "none" {
         if GRADIENT_RE.is_match(&bg_image) {
             if let Some(tc) = text_color {
-                // Over the element's own opaque background-color (no url() layer),
-                // stops composite before the worst is picked; with no such ground,
-                // a stop that paints nothing is skipped. Compared raw, `transparent`
-                // reads as black (issue #881).
+                // Compared raw, `transparent` reads as black (issue #881). Over the
+                // element's own opaque background-color (no url() layer) the layers
+                // composite bottom up, each stop over every color beneath it, before
+                // the worst is picked; with no such ground, a stop that paints
+                // nothing is skipped.
                 let own = parse_rgb_or_any(&dom.style(node, "backgroundColor"))
                     .filter(|c| c.alpha_or_one() >= 0.95 && !URL_RE.is_match(&bg_image));
-                let colors: Vec<Rgba> = parse_gradient_colors(Some(&bg_image))
-                    .into_iter()
-                    .filter_map(|c| match &own {
-                        Some(own) => blend_rgba(Some(&c), Some(own)),
-                        None => (c.alpha_or_one() > 0.05).then_some(c),
-                    })
-                    .collect();
+                let colors: Vec<Rgba> = match own {
+                    Some(own) => split_top_level_commas(&bg_image).iter().rev().fold(vec![own], |ground, layer| {
+                        let stops = parse_gradient_colors(Some(layer));
+                        if stops.is_empty() {
+                            return ground;
+                        }
+                        stops
+                            .iter()
+                            .flat_map(|stop| {
+                                // An opaque stop hides the ground: one color, not one per ground.
+                                let under = if stop.alpha_or_one() >= 0.999 { &ground[..1] } else { &ground[..] };
+                                under.iter().filter_map(move |g| blend_rgba(Some(stop), Some(g)))
+                            })
+                            // A pathological stack is cut off, not expanded without bound.
+                            .take(4096)
+                            .collect()
+                    }),
+                    None => parse_gradient_colors(Some(&bg_image))
+                        .into_iter()
+                        .filter(|c| c.alpha_or_one() > 0.05)
+                        .collect(),
+                };
                 if let Some(color) = pick_worst_contrast_color(tc, &colors) {
                     return CssPlan::Sample {
                         sample: json!({ "status": "sampled", "color": color, "method": "analytic-gradient" }),
@@ -1170,8 +1186,9 @@ mod tests {
             CssPlan::Sample { sample } => rgba_from_value(sample.get("color")).unwrap(),
             other => panic!("{other:?}"),
         };
-        // Over the element's own white, a faded stop is white, never black.
-        assert_eq!(color(&d), rgba(239.0, 238.0, 251.0, 1.0));
+        // Over the element's own white, a faded stop is never black: the worst
+        // is the lavender over the layer beneath it.
+        assert_eq!(color(&d), rgba(236.0, 234.0, 249.0, 1.0));
         // No ground of its own: the stops that paint nothing are skipped.
         d.set_style(sec, "backgroundColor", "rgba(0, 0, 0, 0)");
         assert_eq!(color(&d), rgba(233.0, 231.0, 249.0, 0.72));
@@ -1181,6 +1198,9 @@ mod tests {
             ("backgroundColor", "rgb(255, 255, 255)"),
         ]);
         assert_eq!(color(&d), rgba(0.0, 0.0, 0.0, 0.5));
+        // Stacked layers composite bottom up: the veil lands on the grey, not the white.
+        d.set_style(sec, "backgroundImage", "linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)), linear-gradient(rgb(180, 180, 180), rgb(180, 180, 180))");
+        assert_eq!(color(&d), rgba(90.0, 90.0, 90.0, 1.0));
     }
 
     #[test]
