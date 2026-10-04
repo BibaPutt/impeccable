@@ -49,6 +49,8 @@ re!(
 pub const OVERLAY_SELECTOR: &str =
     ".impeccable-overlay, .impeccable-label, .impeccable-banner, .impeccable-tooltip";
 pub const LIVE_SELECTOR: &str = "[id^=\"impeccable-live-\"]";
+/// The reason a stacked gradient is left to the screenshot check.
+const STACKED_GRADIENTS: &str = "stacked gradients need screenshot pixels";
 
 /// JS `s.replace(/\s+/g, ' ')`.
 fn collapse_ws(s: &str) -> String {
@@ -778,20 +780,25 @@ pub fn css_plan(dom: &dyn Dom, node: ElId, text_color: Option<&Rgba>) -> CssPlan
                 // ground, a stop that paints nothing is skipped.
                 let own = parse_rgb_or_any(&dom.style(node, "backgroundColor"))
                     .filter(|c| c.alpha_or_one() >= 0.95 && !URL_RE.is_match(&bg_image));
+                // Set when a translucent stop lands on more than one color: which
+                // composite is painted then depends on where each of them sits.
+                let mut positional = false;
                 let colors: Option<Vec<Rgba>> = match own {
                     Some(own) => split_top_level_commas(&bg_image).iter().rev().try_fold(vec![own], |ground, layer| {
                         let stops = parse_gradient_colors(Some(layer));
                         if stops.is_empty() {
                             return Some(ground);
                         }
-                        // A translucent stop over more than one color paints a
-                        // different color wherever each of them sits.
-                        if ground.len() > 1 && stops.iter().any(|s| s.alpha_or_one() < 0.999) {
-                            return None;
+                        let mut over: Vec<Rgba> = Vec::new();
+                        for stop in &stops {
+                            // An opaque stop hides the ground: one color, not one per ground.
+                            let under = if stop.alpha_or_one() >= 0.999 { &ground[..1] } else { &ground[..] };
+                            positional |= under.len() > 1;
+                            over.extend(under.iter().filter_map(|g| blend_rgba(Some(stop), Some(g))));
                         }
-                        let mut over: Vec<Rgba> = stops.iter().filter_map(|s| blend_rgba(Some(s), ground.first())).collect();
                         over.dedup();
-                        Some(over)
+                        // A stack too deep to enumerate is left unread, not cut short.
+                        (over.len() <= 4096).then_some(over)
                     }),
                     None => Some(
                         parse_gradient_colors(Some(&bg_image))
@@ -801,17 +808,22 @@ pub fn css_plan(dom: &dyn Dom, node: ElId, text_color: Option<&Rgba>) -> CssPlan
                     ),
                 };
                 let Some(colors) = colors else {
-                    // Where the layers land is geometry this branch does not model.
                     // A sample with no color ends the walk unread, so the
                     // screenshot check decides.
                     return CssPlan::Sample {
-                        sample: json!({ "status": "sampled", "reason": "stacked gradients need screenshot pixels" }),
+                        sample: json!({ "status": "sampled", "reason": STACKED_GRADIENTS }),
                     };
                 };
                 if let Some(color) = pick_worst_contrast_color(tc, &colors) {
-                    return CssPlan::Sample {
-                        sample: json!({ "status": "sampled", "color": color, "method": "analytic-gradient" }),
-                    };
+                    let mut sample = json!({ "status": "sampled", "color": color, "method": "analytic-gradient" });
+                    if positional {
+                        // The other end of the range the stack can show:
+                        // `finish_analysis` keeps the sample only when both ends
+                        // agree on the verdict.
+                        let by_contrast = |a: &&Rgba, b: &&Rgba| contrast_ratio(tc, a).total_cmp(&contrast_ratio(tc, b));
+                        sample["best"] = json!(colors.iter().max_by(by_contrast));
+                    }
+                    return CssPlan::Sample { sample };
                 }
             } else {
                 // JS-PARITY: contrastRatio(null, c) throws in the JS when
@@ -1001,6 +1013,8 @@ pub fn finish_analysis(candidate: &Value, text_color: &Rgba, samples: &[Value], 
     let mut ratios: Vec<f64> = Vec::new();
     let mut methods: Vec<String> = Vec::new();
     let mut unresolved_reasons: Vec<String> = Vec::new();
+    let threshold = candidate.get("threshold").and_then(Value::as_f64).unwrap_or(f64::NAN);
+    let ratio_on = |bg: &Rgba| contrast_ratio(&blend_rgba(Some(text_color), Some(bg)).unwrap(), bg);
     for sample in samples {
         let sampled = sample.get("status").and_then(Value::as_str) == Some("sampled");
         let color = rgba_from_value(sample.get("color"));
@@ -1008,9 +1022,15 @@ pub fn finish_analysis(candidate: &Value, text_color: &Rgba, samples: &[Value], 
             unresolved_reasons.push(str_or_empty(sample.get("reason")));
             continue;
         }
-        let bg = color.unwrap();
-        let fg = blend_rgba(Some(text_color), Some(&bg)).unwrap();
-        ratios.push(contrast_ratio(&fg, &bg));
+        let ratio = ratio_on(&color.unwrap());
+        // A stacked gradient reports the range of colors it can show. When the
+        // two ends disagree on the verdict, the answer depends on where the
+        // text sits, and only pixels can say.
+        if ratio < threshold && rgba_from_value(sample.get("best")).is_some_and(|best| ratio_on(&best) >= threshold) {
+            unresolved_reasons.push(STACKED_GRADIENTS.to_string());
+            continue;
+        }
+        ratios.push(ratio);
         let method = str_or_empty(sample.get("method"));
         if !method.is_empty() && !methods.contains(&method) {
             methods.push(method);
@@ -1044,7 +1064,6 @@ pub fn finish_analysis(candidate: &Value, text_color: &Rgba, samples: &[Value], 
     };
     let measured = pick(10.0);
     let median = pick(50.0);
-    let threshold = candidate.get("threshold").and_then(Value::as_f64).unwrap_or(f64::NAN);
     let status = if measured < threshold { "fail" } else { "pass" };
     let mut sorted_methods = methods.clone();
     sorted_methods.sort();
@@ -1157,6 +1176,16 @@ mod tests {
         assert_eq!(out2["status"], "unresolved");
         assert_eq!(out2["reason"], "not enough readable samples");
         assert_eq!(out2["samples"], json!(1));
+        // A range whose ends disagree on the verdict is left to the pixels;
+        // one whose ends agree is a verdict.
+        let range = |best: f64| -> Vec<Value> {
+            (0..3)
+                .map(|_| json!({ "status": "sampled", "color": { "r": 255, "g": 255, "b": 255, "a": 1 }, "best": { "r": best, "g": best, "b": best, "a": 1 }, "method": "analytic-gradient" }))
+                .collect()
+        };
+        let straddles = finish_analysis(&candidate, &tc, &range(0.0), 3);
+        assert_eq!((&straddles["status"], &straddles["reason"]), (&json!("unresolved"), &json!(STACKED_GRADIENTS)));
+        assert_eq!(finish_analysis(&candidate, &tc, &range(250.0), 3)["status"], "fail");
     }
 
     #[test]
@@ -1207,11 +1236,12 @@ mod tests {
         // Stacked layers composite bottom up: the veil lands on the grey, not the white.
         d.set_style(sec, "backgroundImage", "linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)), linear-gradient(rgb(180, 180, 180), rgb(180, 180, 180))");
         assert_eq!(color(&d), Some(rgba(90.0, 90.0, 90.0, 1.0)));
-        // A translucent layer over one that shows two colors is left to the
-        // pixels: no color, and the walk ends here.
+        // A translucent layer over one that shows two colors reports the range
+        // it can show: the worst, and the best beside it.
         d.set_style(sec, "backgroundImage", &format!("{radial}, {linear}"));
         let stacked = sample(&d);
-        assert!(stacked.get("color").is_none() && sample_is_opaque(&stacked));
+        assert_eq!(rgba_from_value(stacked.get("color")), Some(rgba(236.0, 234.0, 249.0, 1.0)));
+        assert_eq!(rgba_from_value(stacked.get("best")), Some(rgba(255.0, 255.0, 255.0, 1.0)));
     }
 
     #[test]
