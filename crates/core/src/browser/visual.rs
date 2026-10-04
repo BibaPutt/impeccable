@@ -1013,6 +1013,7 @@ pub fn finish_analysis(candidate: &Value, text_color: &Rgba, samples: &[Value], 
     let mut ratios: Vec<f64> = Vec::new();
     let mut methods: Vec<String> = Vec::new();
     let mut unresolved_reasons: Vec<String> = Vec::new();
+    let mut straddles = false;
     let threshold = candidate.get("threshold").and_then(Value::as_f64).unwrap_or(f64::NAN);
     let ratio_on = |bg: &Rgba| contrast_ratio(&blend_rgba(Some(text_color), Some(bg)).unwrap(), bg);
     for sample in samples {
@@ -1027,6 +1028,7 @@ pub fn finish_analysis(candidate: &Value, text_color: &Rgba, samples: &[Value], 
         // two ends disagree on the verdict, the answer depends on where the
         // text sits, and only pixels can say.
         if ratio < threshold && rgba_from_value(sample.get("best")).is_some_and(|best| ratio_on(&best) >= threshold) {
+            straddles = true;
             unresolved_reasons.push(STACKED_GRADIENTS.to_string());
             continue;
         }
@@ -1036,7 +1038,17 @@ pub fn finish_analysis(candidate: &Value, text_color: &Rgba, samples: &[Value], 
             methods.push(method);
         }
     }
-    if ratios.len() < math_min(3.0, points_len as f64) as usize {
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = ratios.len();
+    let pick = |pct: f64| -> f64 {
+        let idx = ((pct / 100.0) * n as f64).floor();
+        let idx = math_min((n - 1) as f64, math_max(0.0, idx)) as usize;
+        ratios[idx]
+    };
+    // A point left to the pixels can hide a failure: the readable points may
+    // fail the text without it, never pass it.
+    let uncertain_pass = straddles && n > 0 && !(pick(10.0) < threshold);
+    if n < math_min(3.0, points_len as f64) as usize || uncertain_pass {
         let mut uniq: Vec<&str> = Vec::new();
         for r in &unresolved_reasons {
             if !r.is_empty() && !uniq.contains(&r.as_str()) {
@@ -1050,18 +1062,11 @@ pub fn finish_analysis(candidate: &Value, text_color: &Rgba, samples: &[Value], 
             vec![
                 ("status", json!("unresolved")),
                 ("confidence", json!("none")),
-                ("samples", json!(ratios.len())),
+                ("samples", json!(n)),
                 ("reason", json!(reason)),
             ],
         );
     }
-    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = ratios.len();
-    let pick = |pct: f64| -> f64 {
-        let idx = ((pct / 100.0) * n as f64).floor();
-        let idx = math_min((n - 1) as f64, math_max(0.0, idx)) as usize;
-        ratios[idx]
-    };
     let measured = pick(10.0);
     let median = pick(50.0);
     let status = if measured < threshold { "fail" } else { "pass" };
@@ -1186,6 +1191,16 @@ mod tests {
         let straddles = finish_analysis(&candidate, &tc, &range(0.0), 3);
         assert_eq!((&straddles["status"], &straddles["reason"]), (&json!("unresolved"), &json!(STACKED_GRADIENTS)));
         assert_eq!(finish_analysis(&candidate, &tc, &range(250.0), 3)["status"], "fail");
+        // One such point beside readable ones: they may fail the text, never pass it.
+        let beside = |r: f64| -> Vec<Value> {
+            let mut v: Vec<Value> = (0..3)
+                .map(|_| json!({ "status": "sampled", "color": { "r": r, "g": r, "b": r, "a": 1 }, "method": "solid-background" }))
+                .collect();
+            v.push(range(0.0).remove(0));
+            v
+        };
+        assert_eq!(finish_analysis(&candidate, &tc, &beside(0.0), 4)["status"], "unresolved");
+        assert_eq!(finish_analysis(&candidate, &tc, &beside(255.0), 4)["status"], "fail");
     }
 
     #[test]
