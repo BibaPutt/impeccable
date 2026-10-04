@@ -774,32 +774,39 @@ pub fn css_plan(dom: &dyn Dom, node: ElId, text_color: Option<&Rgba>) -> CssPlan
             if let Some(tc) = text_color {
                 // Compared raw, `transparent` reads as black (issue #881). Over the
                 // element's own opaque background-color (no url() layer) the layers
-                // composite bottom up, each stop over every color beneath it, before
-                // the worst is picked; with no such ground, a stop that paints
-                // nothing is skipped.
+                // composite bottom up before the worst is picked; with no such
+                // ground, a stop that paints nothing is skipped.
                 let own = parse_rgb_or_any(&dom.style(node, "backgroundColor"))
                     .filter(|c| c.alpha_or_one() >= 0.95 && !URL_RE.is_match(&bg_image));
-                let colors: Vec<Rgba> = match own {
-                    Some(own) => split_top_level_commas(&bg_image).iter().rev().fold(vec![own], |ground, layer| {
+                let colors: Option<Vec<Rgba>> = match own {
+                    Some(own) => split_top_level_commas(&bg_image).iter().rev().try_fold(vec![own], |ground, layer| {
                         let stops = parse_gradient_colors(Some(layer));
                         if stops.is_empty() {
-                            return ground;
+                            return Some(ground);
                         }
-                        stops
-                            .iter()
-                            .flat_map(|stop| {
-                                // An opaque stop hides the ground: one color, not one per ground.
-                                let under = if stop.alpha_or_one() >= 0.999 { &ground[..1] } else { &ground[..] };
-                                under.iter().filter_map(move |g| blend_rgba(Some(stop), Some(g)))
-                            })
-                            // A pathological stack is cut off, not expanded without bound.
-                            .take(4096)
-                            .collect()
+                        // A translucent stop over more than one color paints a
+                        // different color wherever each of them sits.
+                        if ground.len() > 1 && stops.iter().any(|s| s.alpha_or_one() < 0.999) {
+                            return None;
+                        }
+                        let mut over: Vec<Rgba> = stops.iter().filter_map(|s| blend_rgba(Some(s), ground.first())).collect();
+                        over.dedup();
+                        Some(over)
                     }),
-                    None => parse_gradient_colors(Some(&bg_image))
-                        .into_iter()
-                        .filter(|c| c.alpha_or_one() > 0.05)
-                        .collect(),
+                    None => Some(
+                        parse_gradient_colors(Some(&bg_image))
+                            .into_iter()
+                            .filter(|c| c.alpha_or_one() > 0.05)
+                            .collect(),
+                    ),
+                };
+                let Some(colors) = colors else {
+                    // Where the layers land is geometry this branch does not model.
+                    // A sample with no color ends the walk unread, so the
+                    // screenshot check decides.
+                    return CssPlan::Sample {
+                        sample: json!({ "status": "sampled", "reason": "stacked gradients need screenshot pixels" }),
+                    };
                 };
                 if let Some(color) = pick_worst_contrast_color(tc, &colors) {
                     return CssPlan::Sample {
@@ -1177,30 +1184,34 @@ mod tests {
         let mut d = FakeDom::new();
         let (_h, body) = d.with_page();
         let sec = d.add(Some(body), "section");
-        d.set_styles(sec, &[
-            ("backgroundImage", "radial-gradient(at 75% 42%, rgba(233, 231, 249, 0.72) 0px, rgba(0, 0, 0, 0) 58%), linear-gradient(rgb(242, 240, 250), rgba(0, 0, 0, 0) 75%)"),
-            ("backgroundColor", "rgb(255, 255, 255)"),
-        ]);
+        let radial = "radial-gradient(at 75% 42%, rgba(233, 231, 249, 0.72) 0px, rgba(0, 0, 0, 0) 58%)";
+        let linear = "linear-gradient(rgb(242, 240, 250), rgba(0, 0, 0, 0) 75%)";
+        d.set_styles(sec, &[("backgroundImage", radial), ("backgroundColor", "rgb(255, 255, 255)")]);
         let text = rgba(24.0, 25.0, 28.0, 1.0);
-        let color = |d: &FakeDom| match css_plan(d, sec, Some(&text)) {
-            CssPlan::Sample { sample } => rgba_from_value(sample.get("color")).unwrap(),
+        let sample = |d: &FakeDom| match css_plan(d, sec, Some(&text)) {
+            CssPlan::Sample { sample } => sample,
             other => panic!("{other:?}"),
         };
-        // Over the element's own white, a faded stop is never black: the worst
-        // is the lavender over the layer beneath it.
-        assert_eq!(color(&d), rgba(236.0, 234.0, 249.0, 1.0));
+        let color = |d: &FakeDom| rgba_from_value(sample(d).get("color"));
+        // Over the element's own white, a faded stop is never black.
+        assert_eq!(color(&d), Some(rgba(239.0, 238.0, 251.0, 1.0)));
         // No ground of its own: the stops that paint nothing are skipped.
         d.set_style(sec, "backgroundColor", "rgba(0, 0, 0, 0)");
-        assert_eq!(color(&d), rgba(233.0, 231.0, 249.0, 0.72));
+        assert_eq!(color(&d), Some(rgba(233.0, 231.0, 249.0, 0.72)));
         // A url() layer sits between the gradient and the color: the color is not the ground.
         d.set_styles(sec, &[
             ("backgroundImage", "linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0)), url(\"a.png\")"),
             ("backgroundColor", "rgb(255, 255, 255)"),
         ]);
-        assert_eq!(color(&d), rgba(0.0, 0.0, 0.0, 0.5));
+        assert_eq!(color(&d), Some(rgba(0.0, 0.0, 0.0, 0.5)));
         // Stacked layers composite bottom up: the veil lands on the grey, not the white.
         d.set_style(sec, "backgroundImage", "linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)), linear-gradient(rgb(180, 180, 180), rgb(180, 180, 180))");
-        assert_eq!(color(&d), rgba(90.0, 90.0, 90.0, 1.0));
+        assert_eq!(color(&d), Some(rgba(90.0, 90.0, 90.0, 1.0)));
+        // A translucent layer over one that shows two colors is left to the
+        // pixels: no color, and the walk ends here.
+        d.set_style(sec, "backgroundImage", &format!("{radial}, {linear}"));
+        let stacked = sample(&d);
+        assert!(stacked.get("color").is_none() && sample_is_opaque(&stacked));
     }
 
     #[test]
