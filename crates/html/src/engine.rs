@@ -213,8 +213,9 @@ pub fn detect_html_source(
         Meta::new("parse-html", "parse-document", fp),
         || StaticDocument::parse(html),
     );
-    let css_text = collect_static_css_text(&doc, &file_dir, profile, fp, options.warn);
-    build_static_style_map(&mut doc, css_text.as_str(), profile, fp);
+    let css = collect_static_css_text(&doc, &file_dir, profile, fp, options.warn);
+    build_static_style_map(&mut doc, &css, profile, fp);
+    let css_text = css.text;
     let doc = doc;
     let images = ImageSampler::new(&file_dir.to_string_lossy());
 
@@ -401,7 +402,7 @@ pub fn unsupported_selectors(html: &str, file_path: &Path) -> Vec<String> {
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
     let mut doc = StaticDocument::parse(html);
-    let css_text = collect_static_css_text(&doc, &file_dir, None, &file_str, None);
-    build_static_style_map(&mut doc, &css_text, None, &file_str);
+    let css = collect_static_css_text(&doc, &file_dir, None, &file_str, None);
+    build_static_style_map(&mut doc, &css, None, &file_str);
     doc.unsupported_selectors()
 }

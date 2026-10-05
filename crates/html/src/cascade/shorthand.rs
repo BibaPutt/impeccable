@@ -5,7 +5,9 @@
 //! #expandStaticDeclaration
 
 use super::defaults::{is_static_inherited_prop, static_default_style};
-use super::values::{css_prop_to_camel, extract_static_color, split_css_list, split_css_tokens};
+use super::values::{
+    css_call_end, css_prop_to_camel, extract_static_color, split_css_list, split_css_tokens,
+};
 use impeccable_core::js;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -196,14 +198,57 @@ pub fn parse_static_animation(value: &str) -> StaticAnimation {
 static BG_REPEAT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)^(?:repeat|no-repeat|repeat-x|repeat-y|space|round)$").expect("BG_REPEAT_RE")
 });
-static BG_SIZE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)^(?:auto|cover|contain|-?[0-9.]+[a-z%]*)$").expect("BG_SIZE_RE"));
+// One `background-size` component: a keyword, a length or percentage, or a
+// value function (`var()`, `calc()`) the compute loop resolves later.
+static BG_SIZE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)^(?:auto|cover|contain|-?[0-9.]+[a-z%]*|(?:var|calc|min|max|clamp|env)\(.*\))$",
+    )
+    .expect("BG_SIZE_RE")
+});
+// An image value at the head of a token: the call the css-tree generator may
+// glue the next keyword to (`url(a)center/cover`).
+static BG_IMAGE_CALL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)^(?:url|image-set|-webkit-image-set|image|cross-fade|element|paint|(?:repeating-)?(?:linear|radial|conic)-gradient)\(",
+    )
+    .expect("BG_IMAGE_CALL_RE")
+});
+static CSS_WIDE_KEYWORD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^(?:inherit|initial|unset|revert|revert-layer)$").expect("CSS_WIDE_KEYWORD_RE")
+});
+
+/// `token` split at its first top-level `/`, the position / size separator.
+/// A slash inside `calc()` is not one.
+fn split_size_slash(token: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    for (i, b) in token.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'/' if depth == 0 => return Some((&token[..i], &token[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Keywords and units fold to lowercase; a function keeps its case, since
+/// custom property names are case-sensitive.
+fn size_component(token: &str) -> String {
+    if token.contains('(') {
+        token.to_string()
+    } else {
+        js::to_lower_case(token)
+    }
+}
 
 /// The per-layer `background-repeat` and `background-size` lists of a
 /// `background` shorthand (`url(a) center / cover no-repeat, url(b)` ->
-/// `no-repeat, repeat` and `cover, auto`). The css-tree generator may glue
-/// the first keyword to the image (`url(a)center/cover`), so a token that
-/// holds a function call is read up to its closing paren and the rest kept.
+/// `no-repeat, repeat` and `cover, auto`). An image call at the head of a
+/// token is dropped and the rest of the token kept; any other function is a
+/// value and stays whole, so `/ var(--s)` is stored for the compute loop to
+/// resolve instead of collapsing to `auto`.
 fn parse_static_background_layers(value: &str) -> (String, String) {
     let mut repeats: Vec<String> = Vec::new();
     let mut sizes: Vec<String> = Vec::new();
@@ -212,9 +257,9 @@ fn parse_static_background_layers(value: &str) -> (String, String) {
         let mut size: Vec<String> = Vec::new();
         let mut in_size = false;
         for raw in split_css_tokens(&layer) {
-            let token = match raw.rfind(')') {
-                Some(end) if raw.contains('(') => raw[end + 1..].to_string(),
-                _ => raw,
+            let token: &str = match BG_IMAGE_CALL_RE.find(&raw) {
+                Some(call) => &raw[css_call_end(&raw, call.end() - 1)..],
+                None => raw.as_str(),
             };
             if token.is_empty() {
                 in_size = false;
@@ -222,21 +267,21 @@ fn parse_static_background_layers(value: &str) -> (String, String) {
             }
             // `center/cover`, `center / cover`, or `center/ cover`: the size
             // is what follows the slash, one or two values.
-            if let Some((_, after)) = token.split_once('/') {
+            if let Some((_, after)) = split_size_slash(token) {
                 in_size = true;
                 size.clear();
                 if !after.is_empty() && BG_SIZE_RE.is_match(after) {
-                    size.push(js::to_lower_case(after));
+                    size.push(size_component(after));
                 }
                 continue;
             }
-            if in_size && size.len() < 2 && BG_SIZE_RE.is_match(&token) {
-                size.push(js::to_lower_case(&token));
+            if in_size && size.len() < 2 && BG_SIZE_RE.is_match(token) {
+                size.push(size_component(token));
                 continue;
             }
             in_size = false;
-            if repeat.len() < 2 && BG_REPEAT_RE.is_match(&token) {
-                repeat.push(js::to_lower_case(&token));
+            if repeat.len() < 2 && BG_REPEAT_RE.is_match(token) {
+                repeat.push(js::to_lower_case(token));
             }
         }
         repeats.push(if repeat.is_empty() {
@@ -253,41 +298,96 @@ fn parse_static_background_layers(value: &str) -> (String, String) {
     (repeats.join(", "), sizes.join(", "))
 }
 
-/// The `backgroundRepeat` / `backgroundSize` pairs a declaration sets. Not
-/// part of `expand_static_declaration`, whose output the recorded vectors
-/// pin; the cascade stores these beside it (`apply_static_longhand`) so the
-/// sampled-contrast path (#560) can tell a tiled or cover image from a
-/// no-repeat icon. Every `background` shorthand resets both to what it
-/// names, the defaults when it names nothing, as in CSS; a CSS-wide keyword
-/// passes through, and a bare `var()` value is left alone the way the
-/// expansion leaves it.
+/// The background color a shorthand names where `expand_static_declaration`
+/// does not look: after the image (`url(x) #17150f`), or as the final layer
+/// of a list (`url(x), #17150f`). `None` when the expansion already read one
+/// before the first image, or when there is none.
+fn color_outside_image(v: &str) -> Option<String> {
+    let first = BG_IMAGE_SPLIT_RE.find(v)?;
+    if !extract_static_color(&v[..first.start()]).is_empty() {
+        return None;
+    }
+    let layers = split_css_list(v);
+    let last = layers.last()?;
+    let (outside, color_only) = match BG_IMAGE_SPLIT_RE.find(last) {
+        Some(call) => {
+            let end = css_call_end(last, call.end() - 1);
+            (format!("{} {}", &last[..call.start()], &last[end..]), false)
+        }
+        None => (last.clone(), true),
+    };
+    if VAR_ANYWHERE_RE.is_match(&outside) {
+        return None;
+    }
+    let color = extract_static_color(&outside);
+    // A final layer with no image is the color only when it is nothing else:
+    // the `#abc` in `element(#abc)` is not one.
+    let named = !color.is_empty() && (!color_only || color == js::trim(&outside));
+    named.then_some(color)
+}
+
+/// The background longhands a declaration sets beside what
+/// `expand_static_declaration` yields. That expansion is pinned by the
+/// recorded vectors, so what the JS model never carried lives here and
+/// `apply_static_declaration` stores both under one cascade priority:
+///
+/// - `backgroundRepeat` / `backgroundSize`, so the sampled-contrast path
+///   (#560) can tell a tiled or cover image from a no-repeat icon. Every
+///   `background` shorthand resets both to what it names, the defaults when
+///   it names nothing, as in CSS.
+/// - `backgroundImage: none` for a shorthand that names no image, which the
+///   expansion only resets for `background: none`. Without it
+///   `.card.plain { background: transparent }` keeps the image an earlier
+///   rule set.
+/// - `backgroundColor` for a color the shorthand names after its image.
+///
+/// A CSS-wide keyword passes through, and a bare `var()` value is left alone
+/// the way the expansion leaves it.
 pub fn background_longhands(prop: &str, value: &str) -> Vec<Expanded> {
+    // Runs per declaration per matched node: leave before allocating.
+    if !prop
+        .get(..10)
+        .is_some_and(|head| head.eq_ignore_ascii_case("background"))
+    {
+        return Vec::new();
+    }
     let v = js::trim(value);
+    if v.is_empty() {
+        return Vec::new();
+    }
     match js::to_lower_case(prop).as_str() {
-        "background" if VAR_ANYWHERE_RE.is_match(v) && !BG_IMAGE_RE.is_match(v) => Vec::new(),
-        "background" if CSS_WIDE_KEYWORD_RE.is_match(v) => {
-            let keyword = js::to_lower_case(v);
-            vec![
-                ("backgroundRepeat".into(), keyword.clone()),
-                ("backgroundSize".into(), keyword),
-            ]
-        }
-        "background" => {
-            let (repeat, size) = parse_static_background_layers(v);
-            vec![
-                ("backgroundRepeat".into(), repeat),
-                ("backgroundSize".into(), size),
-            ]
-        }
-        "background-repeat" if !v.is_empty() => vec![("backgroundRepeat".into(), v.to_string())],
-        "background-size" if !v.is_empty() => vec![("backgroundSize".into(), v.to_string())],
+        "background" => background_shorthand_longhands(v),
+        "background-repeat" => vec![("backgroundRepeat".into(), v.to_string())],
+        "background-size" => vec![("backgroundSize".into(), v.to_string())],
         _ => Vec::new(),
     }
 }
 
-static CSS_WIDE_KEYWORD_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^(?:inherit|initial|unset|revert|revert-layer)$").expect("CSS_WIDE_KEYWORD_RE")
-});
+fn background_shorthand_longhands(v: &str) -> Vec<Expanded> {
+    let has_image = BG_IMAGE_RE.is_match(v);
+    if VAR_ANYWHERE_RE.is_match(v) && !has_image {
+        return Vec::new();
+    }
+    if CSS_WIDE_KEYWORD_RE.is_match(v) {
+        let keyword = js::to_lower_case(v);
+        return vec![
+            ("backgroundRepeat".into(), keyword.clone()),
+            ("backgroundSize".into(), keyword),
+        ];
+    }
+    let (repeat, size) = parse_static_background_layers(v);
+    let mut out: Vec<Expanded> = vec![
+        ("backgroundRepeat".into(), repeat),
+        ("backgroundSize".into(), size),
+    ];
+    if !has_image {
+        out.push(("backgroundImage".into(), "none".into()));
+    } else if let Some(color) = color_outside_image(v) {
+        out.push(("backgroundColor".into(), color));
+    }
+    out
+}
+
 static BG_IMAGE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)gradient|url\(").expect("BG_IMAGE_RE"));
 static BG_IMAGE_SPLIT_RE: Lazy<Regex> = Lazy::new(|| {

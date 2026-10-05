@@ -10,11 +10,10 @@
 
 use super::checks_shim::CustomProps;
 use super::{
-    apply_static_declaration, apply_static_longhand, background_longhands,
-    collect_static_css_rules, compare_static_priority, is_static_inherited_prop,
-    make_default_style, normalize_static_css_value, parse_static_style_attribute,
-    static_default_style, CssRule, DeclMeta, SpecifiedDecl, SpecifiedStore, StyleValues,
-    STATIC_DEFAULT_STYLE,
+    apply_static_declaration, collect_static_css_rules, collect_static_css_rules_from,
+    compare_static_priority, is_static_inherited_prop, make_default_style,
+    normalize_static_css_value, parse_static_style_attribute, static_default_style, CssRule,
+    DeclMeta, SpecifiedDecl, SpecifiedStore, StyleValues, UrlBase, STATIC_DEFAULT_STYLE,
 };
 use crate::dom::StaticDocument;
 use crate::profile::{self, Meta, ProfileSink};
@@ -86,6 +85,66 @@ pub(crate) fn resolve_linked_css_path(file_dir: &str, href: &str) -> String {
     jsp::join(&[file_dir, &rel])
 }
 
+/// A page's CSS as the cascade reads it: the text of every `<style>` element
+/// and every local linked stylesheet, joined with `\n`, plus where each
+/// stylesheet linked from another directory sits in that text. The text is
+/// never rewritten, so the pattern checks read every sheet as authored; only
+/// the rules collected from a foreign sheet resolve their urls against it.
+#[derive(Debug, Clone, Default)]
+pub struct StaticCss {
+    pub text: String,
+    page_dir: String,
+    foreign_sheets: Vec<ForeignSheet>,
+}
+
+#[derive(Debug, Clone)]
+struct ForeignSheet {
+    start: usize,
+    end: usize,
+    dir: String,
+}
+
+impl StaticCss {
+    /// The rules of the whole text in cascade order. With no foreign sheet
+    /// this is one parse of the joined text, exactly as before; a foreign
+    /// sheet is parsed on its own so its urls can be told apart, and the
+    /// order numbers run on across the stretches.
+    pub fn rules(&self) -> Vec<CssRule> {
+        if self.foreign_sheets.is_empty() {
+            return collect_static_css_rules(&self.text);
+        }
+        let mut rules: Vec<CssRule> = Vec::new();
+        let mut cursor = 0usize;
+        for sheet in &self.foreign_sheets {
+            if sheet.start > cursor {
+                let stretch = &self.text[cursor..sheet.start];
+                rules.extend(collect_static_css_rules_from(
+                    stretch,
+                    rules.len() as i64,
+                    None,
+                ));
+            }
+            let base = UrlBase::new(&sheet.dir, &self.page_dir);
+            let stretch = &self.text[sheet.start..sheet.end];
+            rules.extend(collect_static_css_rules_from(
+                stretch,
+                rules.len() as i64,
+                Some(&base),
+            ));
+            cursor = sheet.end;
+        }
+        if cursor < self.text.len() {
+            let stretch = &self.text[cursor..];
+            rules.extend(collect_static_css_rules_from(
+                stretch,
+                rules.len() as i64,
+                None,
+            ));
+        }
+        rules
+    }
+}
+
 /// JS: css-cascade.mjs#collectStaticCssText(root, fileDir, profile, filePath, modules)
 /// The text of every `<style>` element plus every local `<link rel=stylesheet>`
 /// resolved relative to `file_dir` (query/hash stripped), joined with `\n`.
@@ -97,14 +156,34 @@ pub fn collect_static_css_text(
     profile: Option<&dyn ProfileSink>,
     file_path: &str,
     warn: Option<&dyn Fn(&str)>,
-) -> String {
-    let mut style_texts: Vec<String> = Vec::new();
+) -> StaticCss {
+    let file_dir_str = file_dir.to_string_lossy().into_owned();
+    let mut css = StaticCss {
+        page_dir: file_dir_str.clone(),
+        ..StaticCss::default()
+    };
+    let mut pieces = 0usize;
+    // `style_texts.join('\n')`, built in place so a sheet's span is known.
+    let mut push = |css: &mut StaticCss, piece: &str, foreign_dir: Option<String>| {
+        if pieces > 0 {
+            css.text.push('\n');
+        }
+        pieces += 1;
+        let start = css.text.len();
+        css.text.push_str(piece);
+        if let Some(dir) = foreign_dir {
+            css.foreign_sheets.push(ForeignSheet {
+                start,
+                end: css.text.len(),
+                dir,
+            });
+        }
+    };
     let mut warned_missing_stylesheets: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for style_el in doc.query_selector_all("style") {
-        style_texts.push(style_el.text_content());
+        push(&mut css, &style_el.text_content(), None);
     }
-    let file_dir_str = file_dir.to_string_lossy().into_owned();
     for link in doc.query_selector_all("link") {
         let rel = link.get_attribute("rel").unwrap_or("");
         let href = link.get_attribute("href").unwrap_or("");
@@ -119,13 +198,9 @@ pub fn collect_static_css_text(
         );
         match read {
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
                 let sheet_dir = jsp::dirname(&css_path);
-                style_texts.push(if sheet_dir == file_dir_str {
-                    text.into_owned()
-                } else {
-                    rewrite_sheet_urls(&text, &sheet_dir, &file_dir_str)
-                });
+                let foreign_dir = (sheet_dir != file_dir_str).then_some(sheet_dir);
+                push(&mut css, &String::from_utf8_lossy(&bytes), foreign_dir);
             }
             Err(_) => {
                 if warned_missing_stylesheets.insert(css_path.clone()) {
@@ -138,163 +213,7 @@ pub fn collect_static_css_text(
             }
         }
     }
-    style_texts.join("\n")
-}
-
-// A quoted url cannot span a line and an unquoted one cannot hold
-// whitespace, quotes, parens, braces, or semicolons (CSS syntax), so a
-// stray `url(` can never pair with a `)` in a later rule.
-static CSS_URL_RE: Lazy<Regex> = Lazy::new(|| {
-    // The leading group keeps `url(` from matching inside a longer
-    // identifier such as `myurl(`; the closure emits it unchanged.
-    Regex::new(
-        r#"(?i)(^|[^A-Za-z0-9_-])url\(\s*(?:"((?:[^"\\\n\r]|\\.)*)"|'((?:[^'\\\n\r]|\\.)*)'|([^)"'(\s{};]*))\s*\)"#,
-    )
-    .expect("CSS_URL_RE")
-});
-static URL_SCHEME_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*:").expect("URL_SCHEME_RE"));
-
-/// A relative `url()` in a stylesheet is relative to the sheet, and the
-/// cascade sees one concatenated text, so a sheet inlined from another
-/// directory has its relative urls rewritten to page-relative form here.
-/// This is what lets the sampled-contrast path (#560) resolve the image the
-/// winning declaration named. Root-relative, remote, `data:`, fragment, and
-/// escaped urls are left as they are, and comments are copied through
-/// untouched, so nothing inside one can reach the rules after it.
-pub fn rewrite_sheet_urls(css: &str, sheet_dir: &str, page_dir: &str) -> String {
-    let mut out = String::with_capacity(css.len());
-    let mut cursor = 0usize;
-    for (start, end) in comment_spans(css) {
-        out.push_str(&rewrite_code_urls(&css[cursor..start], sheet_dir, page_dir));
-        out.push_str(&css[start..end]);
-        cursor = end;
-    }
-    out.push_str(&rewrite_code_urls(&css[cursor..], sheet_dir, page_dir));
-    out
-}
-
-/// The byte spans of every `/* */` comment in `css`, found the way the CSS
-/// tokenizer finds them: a `/*` inside a quoted string or an unquoted
-/// `url()` is content, not a comment opener, and an unclosed comment runs to
-/// the end of the sheet. Every span boundary sits on an ASCII byte, so the
-/// spans are valid `str` indices.
-/// A byte that can continue a CSS identifier, so `myurl(` is a custom
-/// function and not the `url(` token.
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b >= 0x80
-}
-
-fn comment_spans(css: &str) -> Vec<(usize, usize)> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum State {
-        Code,
-        Str(u8),
-        Url,
-    }
-    let bytes = css.as_bytes();
-    let mut spans = Vec::new();
-    let mut state = State::Code;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match state {
-            State::Code => {
-                if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
-                    let end = css[i + 2..]
-                        .find("*/")
-                        .map(|at| i + 2 + at + 2)
-                        .unwrap_or(bytes.len());
-                    spans.push((i, end));
-                    i = end;
-                    continue;
-                }
-                if b == b'"' || b == b'\'' {
-                    state = State::Str(b);
-                } else if b.eq_ignore_ascii_case(&b'u')
-                    && css[i..]
-                        .get(..4)
-                        .is_some_and(|s| s.eq_ignore_ascii_case("url("))
-                    && !(i > 0 && is_ident_byte(bytes[i - 1]))
-                {
-                    i += 4;
-                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                        i += 1;
-                    }
-                    // A quoted argument is a string like any other; an
-                    // unquoted one runs to the closing paren.
-                    if i < bytes.len() && bytes[i] != b'"' && bytes[i] != b'\'' {
-                        state = State::Url;
-                    }
-                    continue;
-                }
-            }
-            State::Str(quote) => {
-                if b == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                // A raw newline ends a string in CSS (a bad-string token).
-                if b == quote || b == b'\n' || b == b'\r' {
-                    state = State::Code;
-                }
-            }
-            State::Url => {
-                if b == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b == b')' {
-                    state = State::Code;
-                }
-            }
-        }
-        i += 1;
-    }
-    spans
-}
-
-fn rewrite_code_urls(css: &str, sheet_dir: &str, page_dir: &str) -> String {
-    CSS_URL_RE
-        .replace_all(css, |caps: &regex::Captures| {
-            let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-            let before = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let (target, quote) = match (caps.get(2), caps.get(3), caps.get(4)) {
-                (Some(m), _, _) => (m.as_str(), "\""),
-                (_, Some(m), _) => (m.as_str(), "'"),
-                (_, _, Some(m)) => (js::trim(m.as_str()), ""),
-                _ => return whole.to_string(),
-            };
-            let lower = js::to_lower_case(target);
-            if target.is_empty()
-                || target.contains('\\')
-                || target.starts_with('#')
-                || target.starts_with('/')
-                || lower.starts_with("data:")
-                || URL_SCHEME_RE.is_match(target)
-            {
-                return whole.to_string();
-            }
-            let cut = target.find(['?', '#']).unwrap_or(target.len());
-            let (path, suffix) = target.split_at(cut);
-            // Pure POSIX string math on both directories: a CSS url is
-            // POSIX on every OS, and the win32 helpers would render a drive
-            // path (`D:\a\...`) differently from the url beside it.
-            let sheet = jsp::to_posix(sheet_dir);
-            let page = jsp::to_posix(page_dir);
-            let absolute = jsp::posix::resolve("/", &[&sheet, path]);
-            let relative = jsp::posix::relative("/", &page, &absolute);
-            if relative.is_empty() {
-                return whole.to_string();
-            }
-            let needs_quotes = quote.is_empty()
-                && relative
-                    .chars()
-                    .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\''));
-            let quote = if needs_quotes { "\"" } else { quote };
-            format!("{before}url({quote}{relative}{suffix}{quote})")
-        })
-        .into_owned()
+    css
 }
 
 static PSEUDO_RULE_RE: Lazy<Regex> = Lazy::new(|| {
@@ -436,18 +355,18 @@ fn mark_pseudo_rule(
 /// JS: css-cascade.mjs#buildStaticStyleMap(root, staticDoc, cssText, modules, profile, filePath)
 pub fn build_static_style_map(
     doc: &mut StaticDocument,
-    css_text: &str,
+    css: &StaticCss,
     profile: Option<&dyn ProfileSink>,
     file_path: &str,
 ) {
     let mut specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
     let mut hover_specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
     let mut placeholder_specified: SpecifiedStore<NodeId> = SpecifiedStore::new();
-    let root_custom_props = collect_css_custom_props(css_text);
+    let root_custom_props = collect_css_custom_props(&css.text);
     let rules = profile::step(
         profile,
         Meta::new("parse-css", "css-rules", file_path),
-        || collect_static_css_rules(css_text),
+        || css.rules(),
     );
 
     profile::step(
@@ -513,9 +432,6 @@ pub fn build_static_style_map(
                             inline: false,
                         };
                         apply_static_declaration(store, node, &decl.prop, &decl.value, &meta);
-                        for (prop, value) in background_longhands(&decl.prop, &decl.value) {
-                            apply_static_longhand(store, node, &prop, &value, &meta);
-                        }
                     }
                 }
             }
@@ -539,9 +455,6 @@ pub fn build_static_style_map(
                         inline: true,
                     };
                     apply_static_declaration(&mut specified, node, &decl.prop, &decl.value, &meta);
-                    for (prop, value) in background_longhands(&decl.prop, &decl.value) {
-                        apply_static_longhand(&mut specified, node, &prop, &value, &meta);
-                    }
                 }
                 inline_order += 1000;
             }

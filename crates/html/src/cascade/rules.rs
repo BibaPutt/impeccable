@@ -65,8 +65,9 @@
 //!   parse in the same process).
 
 use super::csstree::{self, Important, Node};
-use super::shorthand::{expand_static_box_values, expand_static_declaration};
+use super::shorthand::{background_longhands, expand_static_box_values, expand_static_declaration};
 use super::values::split_css_tokens;
+use impeccable_common::jsp;
 use impeccable_core::js;
 use indexmap::IndexMap;
 use once_cell::sync::Lazy;
@@ -255,40 +256,17 @@ pub fn apply_static_declaration<K: Hash + Eq>(
     let map = specified.map.entry(node).or_default();
     let mut expanded = expand_static_declaration(prop, value);
     expanded.extend(internal_border_style_expansion(prop, value));
+    expanded.extend(background_longhands(prop, value));
     for (expanded_prop, expanded_value) in expanded {
-        apply_expanded(map, &expanded_prop, &expanded_value, meta);
-    }
-}
-
-/// Stores one already-expanded longhand for `node` under the cascade's
-/// priority rule, the way `apply_static_declaration` stores each pair the
-/// shorthand expansion yields. For the longhands that ride beside that
-/// expansion rather than inside it (`background_longhands`).
-pub fn apply_static_longhand<K: Hash + Eq>(
-    specified: &mut SpecifiedStore<K>,
-    node: K,
-    prop: &str,
-    value: &str,
-    meta: &DeclMeta,
-) {
-    let map = specified.map.entry(node).or_default();
-    apply_expanded(map, prop, value, meta);
-}
-
-fn apply_expanded(
-    map: &mut IndexMap<String, SpecifiedDecl>,
-    prop: &str,
-    value: &str,
-    meta: &DeclMeta,
-) {
-    let existing = map.get(prop).map(|d| &d.meta);
-    if compare_static_priority(existing, meta) {
-        let next = SpecifiedDecl {
-            meta: meta.clone(),
-            prop: prop.to_string(),
-            value: value.to_string(),
-        };
-        map.insert(prop.to_string(), next);
+        let existing = map.get(&expanded_prop).map(|d| &d.meta);
+        if compare_static_priority(existing, meta) {
+            let next = SpecifiedDecl {
+                meta: meta.clone(),
+                prop: expanded_prop.clone(),
+                value: expanded_value,
+            };
+            map.insert(expanded_prop, next);
+        }
     }
 }
 
@@ -402,20 +380,127 @@ fn star_empty_compounds(s: &str) -> String {
 
 /// JS: css-cascade.mjs#collectStaticCssRules(cssText, csstree)
 pub fn collect_static_css_rules(css_text: &str) -> Vec<CssRule> {
+    collect_static_css_rules_from(css_text, 0, None)
+}
+
+/// `collect_static_css_rules` for one stretch of a page's CSS: `order_start`
+/// continues the cascade order of the stretches before it, and `url_base`,
+/// set for a stylesheet linked from another directory, resolves that sheet's
+/// relative `url()`s against the sheet (see [`UrlBase`]).
+pub fn collect_static_css_rules_from(
+    css_text: &str,
+    order_start: i64,
+    url_base: Option<&UrlBase>,
+) -> Vec<CssRule> {
     let mut rules: Vec<CssRule> = Vec::new();
     let ast = match csstree::parse_stylesheet(css_text) {
         Ok(ast) => ast,
         Err(_) => return rules,
     };
-    let mut order: i64 = 0;
+    let mut order: i64 = order_start;
     let Node::StyleSheet { children } = &ast else {
         return rules;
     };
-    walk_list(children, &[], &mut rules, &mut order);
+    walk_list(children, &[], &mut rules, &mut order, url_base);
     rules
 }
 
-fn walk_list(list: &[Node], at_rule_stack: &[String], rules: &mut Vec<CssRule>, order: &mut i64) {
+static URL_SCHEME_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*:").expect("URL_SCHEME_RE"));
+
+/// Where a linked stylesheet lives relative to the page that links it. A
+/// relative `url()` in a stylesheet is relative to the sheet, while the
+/// cascade keeps one computed style per element with no memory of which
+/// sheet a value came from, so the url is restated relative to the page as
+/// its declaration is read: on the parsed `Url` node, where css-tree has
+/// already decoded it, never on the stylesheet text. The path math is POSIX
+/// on both directories, since a CSS url is POSIX on every OS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlBase {
+    sheet_dir: String,
+    page_dir: String,
+}
+
+impl UrlBase {
+    pub fn new(sheet_dir: &str, page_dir: &str) -> Self {
+        UrlBase {
+            sheet_dir: jsp::to_posix(sheet_dir),
+            page_dir: jsp::to_posix(page_dir),
+        }
+    }
+
+    /// `url` restated relative to the page, or `None` when it already means
+    /// the same thing from both directories: root-relative, remote, `data:`,
+    /// a fragment, or empty.
+    fn rebase(&self, url: &str) -> Option<String> {
+        let target = js::trim(url);
+        if target.is_empty()
+            || target.starts_with('#')
+            || target.starts_with('/')
+            || URL_SCHEME_RE.is_match(target)
+        {
+            return None;
+        }
+        let cut = target.find(['?', '#']).unwrap_or(target.len());
+        let (path, suffix) = target.split_at(cut);
+        let absolute = jsp::posix::resolve("/", &[&self.sheet_dir, path]);
+        let relative = jsp::posix::relative("/", &self.page_dir, &absolute);
+        if relative.is_empty() || relative == path {
+            return None;
+        }
+        Some(format!("{relative}{suffix}"))
+    }
+}
+
+/// `node` with every `Url` beneath it rebased, or `None` when nothing in it
+/// changes, so the common declaration is generated without a copy. A custom
+/// property's value is `Raw` to the stylesheet parse; one that mentions a
+/// url is read as a value first, so `--hero: url(../img/hero.jpg)` follows
+/// its sheet like any other declaration.
+fn rebase_urls(node: &Node, base: &UrlBase) -> Option<Node> {
+    let children_of = |children: &[Node]| -> Option<Vec<Node>> {
+        let mut out: Option<Vec<Node>> = None;
+        for (i, child) in children.iter().enumerate() {
+            if let Some(rebased) = rebase_urls(child, base) {
+                out.get_or_insert_with(|| children.to_vec())[i] = rebased;
+            }
+        }
+        out
+    };
+    match node {
+        Node::Url { value } => base.rebase(value).map(|value| Node::Url { value }),
+        Node::Raw { value } => {
+            let mentions_url = value
+                .as_bytes()
+                .windows(4)
+                .any(|window| window.eq_ignore_ascii_case(b"url("));
+            if !mentions_url {
+                return None;
+            }
+            rebase_urls(&csstree::parse_value(value).ok()?, base)
+        }
+        Node::Value { children } => children_of(children).map(|children| Node::Value { children }),
+        Node::Parentheses { children } => {
+            children_of(children).map(|children| Node::Parentheses { children })
+        }
+        Node::Brackets { children } => {
+            children_of(children).map(|children| Node::Brackets { children })
+        }
+        Node::Function { name, children } => children_of(children).map(|children| Node::Function {
+            name: name.clone(),
+            children,
+        }),
+        _ => None,
+    }
+}
+
+fn walk_list(
+    list: &[Node],
+    at_rule_stack: &[String],
+    rules: &mut Vec<CssRule>,
+    order: &mut i64,
+    url_base: Option<&UrlBase>,
+) {
     for node in list {
         match node {
             Node::Rule { prelude, block } => {
@@ -436,7 +521,8 @@ fn walk_list(list: &[Node], at_rule_stack: &[String], rules: &mut Vec<CssRule>, 
                             value,
                         } = child
                         {
-                            let generated = csstree::generate(value);
+                            let rebased = url_base.and_then(|base| rebase_urls(value, base));
+                            let generated = csstree::generate(rebased.as_ref().unwrap_or(value));
                             declarations.push(RuleDecl {
                                 prop: property.clone(),
                                 value: js::trim(&generated).to_string(),
@@ -491,7 +577,7 @@ fn walk_list(list: &[Node], at_rule_stack: &[String], rules: &mut Vec<CssRule>, 
                     if let Node::Block { children } = &**block {
                         let mut stack: Vec<String> = at_rule_stack.to_vec();
                         stack.push(lower);
-                        walk_list(children, &stack, rules, order);
+                        walk_list(children, &stack, rules, order, url_base);
                     }
                 }
             }

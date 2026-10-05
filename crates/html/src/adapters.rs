@@ -12,7 +12,7 @@ use crate::background::{
 };
 use crate::cascade::StyleValues;
 use crate::dom::{StaticDocument, StaticElement};
-use crate::image_sampling::{ground_label, ImageSampler};
+use crate::image_sampling::{ground_label, layer_url, ImageSampler};
 use crate::quality::{collapse_ws, pf0, resolve_font_size_px};
 use impeccable_core::checks::measures::{
     self, border_colors_from_style, border_widths_from_style, check_gpt_thin_border_wide_shadow,
@@ -26,7 +26,7 @@ use impeccable_core::checks::rules::{
     BorderOpts, ColorOpts, GlowOpts, HeroEyebrowOpts, HoverContrastOpts, IconTileOpts,
     ItalicSerifOpts, KickerCandidate, MotionOpts, RuleHit, Sides,
 };
-use impeccable_core::checks::sampled_contrast;
+use impeccable_core::checks::sampled_contrast::{self, Sampled};
 use impeccable_core::checks::text_rules::{
     check_numbered_section_labels, is_kicker_candidate, is_numbered_section_label_candidate,
     parse_numbered_label_text, KickerCandidateInput, NumberedLabelCandidate,
@@ -509,11 +509,13 @@ pub fn check_element_colors(
 
     let mut final_effective_bg = effective_bg;
     let mut surface_unresolved = bg_info.unresolved;
+    let mut pseudo_surface = false;
     if own_bg.is_none() || own_bg.is_some_and(|c| c.alpha_or_one() <= 0.5) {
         if let Some(pseudo) = el.doc.get_pseudo_surface(el.id()) {
             own_bg = Some(pseudo);
             final_effective_bg = Some(pseudo);
             surface_unresolved = false;
+            pseudo_surface = true;
         }
     }
 
@@ -565,9 +567,26 @@ pub fn check_element_colors(
         class_list: Some(el.class_name().to_string()),
         detector_is_browser: false,
     };
-    let mut findings = check_colors(&color_opts);
-    if surface_unresolved {
-        findings.extend(sampled_image_contrast(el, &color_opts, images));
+    // Where the ground is an image the engine can read, its pixels are the
+    // ground: the analytic pair (nothing, or a fallback color the image
+    // covers) gets no say, whichever way the sampled verdict goes. An
+    // element's own `::before` surface hides the image, so it keeps the
+    // analytic answer.
+    let sampled = if pseudo_surface {
+        None
+    } else {
+        sampled_image_contrast(el, &color_opts, images)
+    };
+    let mut findings = match &sampled {
+        Some(_) => check_colors(&ColorOpts {
+            effective_bg: None,
+            effective_bg_stops: None,
+            ..color_opts.clone()
+        }),
+        None => check_colors(&color_opts),
+    };
+    if let Some(Sampled::Fail(hit)) = sampled {
+        findings.push(hit);
     }
     if tag == "input" || tag == "textarea" {
         let placeholder = el.get_attribute("placeholder").unwrap_or("").trim();
@@ -606,28 +625,39 @@ pub fn check_element_colors(
     findings
 }
 
-/// The sampled-contrast path (#560): when the analytic walk gave up at a
-/// `url()` layer, read that image and measure the text against a grid of
-/// its pixels. Every gate that needs no IO runs first, so a container
-/// without direct text never touches the file.
+/// The sampled-contrast path (#560): when the text sits on a `url()` layer
+/// the engine can read, measure it against a grid of that image's pixels.
+/// Every gate that needs no IO runs first, the header is read before any
+/// pixel, and nothing is decoded for a layer that is not the ground.
 fn sampled_image_contrast(
     el: &StaticElement<'_>,
     opts: &ColorOpts,
     images: &ImageSampler,
-) -> Option<RuleHit> {
+) -> Option<Sampled> {
     if !sampled_contrast::applies(opts) {
         return None;
     }
-    let ground = find_image_ground(el)?;
-    let raster = images.load(&ground.url)?;
-    if sampled_contrast::is_decorative_layer(
-        &ground.repeat,
-        &ground.size,
-        raster.intrinsic_width as f64,
-        raster.intrinsic_height as f64,
-    ) {
+    let ground = find_image_ground(el, images.levels())?;
+    let source = images.source(el.doc, ground.node, &ground.layer)?;
+    let extents = sampled_contrast::layer_extents(
+        &ground.layer.repeat,
+        &ground.layer.size,
+        source.width as f64,
+        source.height as f64,
+        ground.layer.font_size,
+    );
+    // Over an opaque fallback color the image has to provably fill the box
+    // before its pixels replace that color as the ground. With no such
+    // color, anything that is not decoration is the best evidence there is.
+    let is_ground = if ground.over_opaque_color {
+        sampled_contrast::covers_box(extents)
+    } else {
+        !sampled_contrast::is_decoration(extents)
+    };
+    if !is_ground {
         return None;
     }
+    let raster = images.raster(el.doc, ground.node, &ground.layer, &source)?;
     let points = sampled_contrast::grid_points(raster.width as usize, raster.height as usize);
     let samples: Vec<Rgba> = points
         .iter()
@@ -635,7 +665,8 @@ fn sampled_image_contrast(
             sampled_contrast::composite_sample(raster.pixel(x, y), ground.under, &ground.overlays)
         })
         .collect();
-    sampled_contrast::sampled_contrast(opts, &ground_label(&ground.url), &samples, points.len())
+    let label = ground_label(&layer_url(el.doc, ground.node, &ground.layer));
+    sampled_contrast::sampled_contrast(opts, &label, &samples, points.len())
 }
 
 /// JS: checks.mjs#checkElementHoverContrast(el, style, tag, window)
