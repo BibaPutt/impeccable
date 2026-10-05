@@ -672,57 +672,24 @@ fn sampled_image_contrast(
     sampled_contrast::sampled_contrast(opts, &label, &samples, points.len())
 }
 
-/// Elements that are inline boxes unless `display` says otherwise.
-const INLINE_TAGS: &[&str] = &[
-    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "dfn", "em", "i", "kbd", "label",
-    "mark", "q", "s", "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var",
-];
-
-fn is_inline_box(el: &StaticElement<'_>) -> bool {
-    match sv(el.style(), "display") {
-        "" => INLINE_TAGS.contains(&el.tag_lower().as_str()),
-        display => display.eq_ignore_ascii_case("inline"),
-    }
-}
-
 /// Text hidden on purpose over the image that stands in for it: a
-/// visually-hidden label, `font-size: 0`, or a `text-indent` that throws the
-/// whole text out of its box. The image is the label, so there is no
-/// contrast to measure. A browser can tell by the boxes (the DOM path never
-/// measures one under 10px); a file scan has none and goes by the
-/// declarations that make them.
+/// visually-hidden label, `font-size: 0`, or a `text-indent` of `-9999px`
+/// and the like on the element or anything above it. The image is the
+/// label, so there is no contrast to measure. A browser can tell by the
+/// boxes (the DOM path never measures one under 10px); a file scan has none
+/// and goes by the declarations that make them.
 ///
-/// `text-indent` moves the first line of a block, so the block that holds
-/// the text is the one that counts, not an inline box inside it, and both it
-/// and `white-space` inherit: the nearest declaration at or above that block
-/// applies. `-9999px` stretches the first line far enough to take all of the
-/// text with it. `100%` only moves the first line, so it hides the text
-/// only where nothing wraps and the block clips its overflow.
+/// A far indent anywhere above the text is taken at its word. Whether a
+/// descendant that resets it shows its text again depends on box types the
+/// static engine does not have, and so does the `text-indent: 100%` form
+/// (wrapping, clipping), so neither is modelled: the first keeps the skip,
+/// the second is measured like any other text.
 fn replaced_by_its_image(el: &StaticElement<'_>) -> bool {
     let style = el.style();
-    if is_visually_hidden(el, style) || parse_float(sv(style, "fontSize")) == 0.0 {
-        return true;
-    }
-    let mut block = *el;
-    while is_inline_box(&block) {
-        let Some(parent) = block.parent_element() else {
-            break;
-        };
-        block = parent;
-    }
-    let inherited = |prop: &str| {
-        std::iter::successors(Some(block), |e| e.parent_element())
-            .map(|e| js::trim(sv(e.style(), prop)))
-            .find(|value| !value.is_empty())
-            .unwrap_or("")
-    };
-    let indent = inherited("textIndent");
-    let amount = parse_float(indent);
-    amount <= -999.0
-        || (indent.ends_with('%')
-            && amount >= 100.0
-            && inherited("whiteSpace") == "nowrap"
-            && matches!(sv(block.style(), "overflow"), "hidden" | "clip"))
+    is_visually_hidden(el, style)
+        || parse_float(sv(style, "fontSize")) == 0.0
+        || std::iter::successors(Some(*el), |e| e.parent_element())
+            .any(|e| parse_float(sv(e.style(), "textIndent")) <= -999.0)
 }
 
 /// JS: checks.mjs#checkElementHoverContrast(el, style, tag, window)
