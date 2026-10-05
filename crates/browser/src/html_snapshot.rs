@@ -197,16 +197,10 @@ impl HtmlSnapshot {
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::Acquire) {
                 match listener.accept() {
-                    // One thread per connection: Chrome opens sockets it may
-                    // leave idle (backup connect jobs, preconnects), and one
-                    // of those must not hold the page's requests behind its
-                    // read timeout.
-                    Ok((mut stream, _)) => {
-                        worker_connections.track(&stream);
+                    Ok((stream, _)) => {
                         let (host, snapshot) = (worker_host.clone(), snapshot.clone());
-                        thread::spawn(move || {
-                            let _ = respond(&mut stream, &host, &snapshot, scripts);
-                            let _ = stream.shutdown(Shutdown::Write);
+                        worker_connections.spawn(stream, move |stream| {
+                            let _ = respond(stream, &host, &snapshot, scripts);
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -329,18 +323,34 @@ fn encode_path(path: &str) -> String {
         })
         .collect()
 }
-/// The server's accepted sockets, so dropping the server ends every connection
-/// thread at once instead of leaving idle ones to their read timeout.
+/// A snapshot server's open connections, each answered on its own thread.
+/// Chrome opens sockets it may leave idle (backup connect jobs, preconnects),
+/// and one of those must not hold the page's requests behind its read
+/// timeout. A finished connection leaves the set; dropping the server closes
+/// the rest at once instead of leaving them to their read timeout.
 #[derive(Clone, Default)]
-pub struct Connections(Arc<Mutex<Vec<TcpStream>>>);
+pub struct Connections(Arc<Mutex<(u64, BTreeMap<u64, TcpStream>)>>);
 impl Connections {
-    pub fn track(&self, stream: &TcpStream) {
-        if let Ok(handle) = stream.try_clone() {
-            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
-        }
+    pub fn spawn(&self, mut stream: TcpStream, answer: impl FnOnce(&mut TcpStream) + Send + 'static) {
+        let id = {
+            let mut open = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            open.0 += 1;
+            let id = open.0;
+            if let Ok(handle) = stream.try_clone() {
+                open.1.insert(id, handle);
+            }
+            id
+        };
+        let open = self.clone();
+        thread::spawn(move || {
+            answer(&mut stream);
+            let _ = stream.shutdown(Shutdown::Write);
+            open.0.lock().unwrap_or_else(|e| e.into_inner()).1.remove(&id);
+        });
     }
     pub fn close_all(&self) {
-        for stream in self.0.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        let open = std::mem::take(&mut self.0.lock().unwrap_or_else(|e| e.into_inner()).1);
+        for stream in open.into_values() {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
@@ -427,4 +437,24 @@ fn respond(
         body.len()
     )?;
     stream.write_all(body)
+}
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    #[test]
+    fn finished_connections_leave_the_open_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let open = Connections::default();
+        let _client = TcpStream::connect(addr).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        open.spawn(stream, move |_| tx.send(()).unwrap());
+        rx.recv().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !open.0.lock().unwrap().1.is_empty() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(open.0.lock().unwrap().1.is_empty(), "a finished connection kept its socket handle");
+    }
 }

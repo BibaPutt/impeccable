@@ -12,7 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{Read, Write},
-    net::{Shutdown, TcpListener, TcpStream},
+    net::{TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -301,16 +301,10 @@ impl HtmlSnapshot {
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::Acquire) {
                 match listener.accept() {
-                    // One thread per connection: Chrome opens sockets it may
-                    // leave idle (backup connect jobs, preconnects), and one
-                    // of those must not hold the page's requests behind its
-                    // read timeout.
-                    Ok((mut stream, _)) => {
-                        worker_connections.track(&stream);
+                    Ok((stream, _)) => {
                         let (host, snapshot) = (worker_host.clone(), snapshot.clone());
-                        thread::spawn(move || {
-                            let _ = respond(&mut stream, &host, &snapshot);
-                            let _ = stream.shutdown(Shutdown::Write);
+                        worker_connections.spawn(stream, move |stream| {
+                            let _ = respond(stream, &host, &snapshot);
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
