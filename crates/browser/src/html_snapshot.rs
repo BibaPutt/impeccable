@@ -195,8 +195,15 @@ impl HtmlSnapshot {
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::Acquire) {
                 match listener.accept() {
+                    // One thread per connection: Chrome opens sockets it may
+                    // leave idle (backup connect jobs, preconnects), and one
+                    // of those must not hold the page's requests behind its
+                    // read timeout.
                     Ok((mut stream, _)) => {
-                        let _ = respond(&mut stream, &worker_host, &snapshot, scripts);
+                        let (host, snapshot) = (worker_host.clone(), snapshot.clone());
+                        thread::spawn(move || {
+                            let _ = respond(&mut stream, &host, &snapshot, scripts);
+                        });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5))
