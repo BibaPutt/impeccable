@@ -51,12 +51,17 @@ export const LAUNCHER_NAME_WINDOWS = 'impeccable.cmd';
 export const guardedLauncher = (launcherPath, verb = 'hook') =>
   `[ ! -f "${launcherPath}" ] || "${launcherPath}" ${verb}`;
 
-// cmd.exe form for harnesses that read a `commandWindows` sibling (Codex
-// 0.146.0+ selects it on Windows; issue #452). `exit /b` forwards the
-// launcher's errorlevel. Paths keep forward slashes; cmd.exe accepts them in
-// quoted paths and it is the form the CLI already writes.
-export const windowsLauncherCommand = (launcherCmdPath, verb = 'hook') =>
-  `if exist "${launcherCmdPath}" ("${launcherCmdPath}" ${verb} & exit /b)`;
+// Windows form for harnesses that read a `commandWindows` sibling (Codex
+// 0.146.0+ selects it on Windows; issue #452). Codex runs it in the session
+// shell, PowerShell by default and cmd.exe only as a fallback (#848), so the
+// string starts with `cmd /c`, an ordinary command in both, and cmd.exe gets
+// the guard: a missing launcher exits 0, a failing one non-zero. Backslash
+// separators: PowerShell drops the quotes around a space-free argument, and
+// cmd.exe would read a bare `/` as a switch.
+export const windowsLauncherCommand = (launcherCmdPath, verb = 'hook') => {
+  const quoted = `"${launcherCmdPath.replaceAll('/', '\\')}"`;
+  return `cmd /c if exist ${quoted} ${quoted} ${verb}`;
+};
 
 function stopEntry(command, commandWindows) {
   return {
@@ -94,10 +99,12 @@ const GROK_PROJECT_SCRIPTS = '.grok/skills/impeccable/scripts';
 // `windows: true` adds the `commandWindows` sibling; only Codex-shaped
 // consumers honor it, and an unknown key would fail Codex's strict parser if
 // it were the other way round, so it stays opt-in per manifest.
-function buildClaudeCompatibleHooks(matcher, scriptsDir, { windows = false } = {}) {
+function buildClaudeCompatibleHooks(matcher, scriptsDir, { windows = false, sessionIdentity = false } = {}) {
   const command = guardedLauncher(launcherIn(scriptsDir));
   const commandWindows = windows ? windowsLauncherCommand(launcherCmdIn(scriptsDir)) : undefined;
   return {
+    ...(sessionIdentity ? { SessionStart: [{ hooks: [{ type: 'command', command,
+      timeout: TIMEOUT_SECONDS, statusMessage: 'Preparing build session' }] }] } : {}),
     PostToolUse: [
       {
         matcher,
@@ -119,7 +126,7 @@ function buildClaudeCompatibleHooks(matcher, scriptsDir, { windows = false } = {
 export function buildClaudeSettingsManifest() {
   return {
     description: 'Impeccable design detector: immediate-tier checks after Edit/Write on UI files, full-rule deep pass on Stop.',
-    hooks: buildClaudeCompatibleHooks('Edit|Write', CLAUDE_PROJECT_SCRIPTS),
+    hooks: buildClaudeCompatibleHooks('Edit|Write', CLAUDE_PROJECT_SCRIPTS, { sessionIdentity: true }),
   };
 }
 
@@ -131,7 +138,7 @@ export function buildClaudeSettingsManifest() {
 // than `hooks`, failing the whole manifest (issue #330).
 export function buildClaudePluginHooksManifest() {
   return {
-    hooks: buildClaudeCompatibleHooks('Edit|Write', CLAUDE_PLUGIN_SCRIPTS),
+    hooks: buildClaudeCompatibleHooks('Edit|Write', CLAUDE_PLUGIN_SCRIPTS, { sessionIdentity: true }),
   };
 }
 
@@ -198,11 +205,33 @@ export function buildGitHubHooksManifest() {
 // folder trust (`/hooks-trust` or `--trust`) before they run. Event schema is
 // Claude-compatible (PostToolUse / Stop / PreToolUse); Claude tool names in
 // matchers are aliased to Grok tools (Edit|Write|MultiEdit → search_replace).
+// There is no per-OS command field; a Windows install rewrites `command` to
+// the `cmd /c` form (crates/skills hook_manifest.rs).
 // https://docs.x.ai/build/features/hooks
 export function buildGrokHooksManifest() {
   return {
     hooks: buildClaudeCompatibleHooks('Edit|Write|MultiEdit', GROK_PROJECT_SCRIPTS),
   };
+}
+
+// Gemini's hook timeouts are milliseconds. BeforeTool carries the session id
+// into `build-phase` shell calls only; AfterAgent uses the engine's shared
+// completion check. Gemini substitutes `$GEMINI_PROJECT_DIR` in the command
+// text with an already shell-escaped path before `bash -c` runs it, so the
+// token stays bare: inside double quotes the escaping would turn literal.
+// There is no per-OS command field; a Windows install rewrites this to a
+// PowerShell form (crates/skills hook_manifest.rs).
+export function buildGeminiHooksManifest() {
+  const launcher = '$GEMINI_PROJECT_DIR/.gemini/skills/impeccable/scripts/impeccable';
+  const command = `[ ! -f ${launcher} ] || ${launcher} hook`;
+  return { hooks: {
+    BeforeTool: [{ matcher: '^run_shell_command$', hooks: [{
+      name: 'impeccable-session', type: 'command', command, timeout: 5000,
+    }] }],
+    AfterAgent: [{ hooks: [{
+      name: 'impeccable-completion', type: 'command', command, timeout: 30000,
+    }] }],
+  } };
 }
 
 export function hooksJsonFor(provider, options = {}) {
@@ -217,6 +246,8 @@ export function hooksJsonFor(provider, options = {}) {
       return buildGitHubHooksManifest();
     case 'grok':
       return buildGrokHooksManifest();
+    case 'gemini':
+      return buildGeminiHooksManifest();
     default:
       return null;
   }

@@ -73,6 +73,25 @@ pub fn is_launcher_hook_command(command: &str) -> bool {
     LAUNCHER_HOOK_MARKER.is_match(&normalize_hook_separators(command))
 }
 
+/// The Windows hook string for a harness that runs it in the session shell
+/// (Codex `commandWindows`, Grok `command`; #848, #859): the `.cmd` shim of
+/// `launcher` behind an `if exist` guard. Built here, beside the recognizers,
+/// so install and `hooks on` write one string (`transformers/hooks.js`
+/// `windowsLauncherCommand` is the build's twin). That shell is PowerShell by
+/// default, where a bare `if exist (...)` or POSIX guard is a parse error;
+/// `cmd /c` is an ordinary command there, in cmd.exe, and in Git Bash with
+/// MSYS path conversion off (how Grok runs it), and hands the guard to
+/// cmd.exe. A missing shim exits 0. A failing one exits non-zero, though
+/// PowerShell's `-Command` reports any native failure as 1. Backslash
+/// separators because PowerShell drops the quotes around a space-free argument
+/// and cmd.exe reads a bare `/` as a switch. `GROK_SHELL=cmd` stays
+/// unsupported: Grok escapes the quotes as `\"` on the way to cmd.exe, which
+/// no quoted path survives.
+pub fn windows_launcher_hook_command(launcher: &str, verb: &str) -> String {
+    let shim = format!("\"{}.cmd\"", launcher.replace('/', "\\"));
+    format!("cmd /c if exist {shim} {shim} {verb}")
+}
+
 /// The launcher-era markers `context` and `doctor` treat as the design hook
 /// proper (the per-edit hook and Cursor's before-edit gate). Legacy siblings
 /// like `hook-probe` are admin-only and do not count as an installed hook.
@@ -153,6 +172,7 @@ mod tests {
             "\"$(git rev-parse --show-toplevel)/.github/skills/impeccable/scripts/impeccable\" hook",
             "[ ! -f '/x/.claude/skills/impeccable/scripts/impeccable' ] || '/x/.claude/skills/impeccable/scripts/impeccable' hook",
             "if exist \".agents/skills/impeccable/scripts/impeccable.cmd\" (\".agents/skills/impeccable/scripts/impeccable.cmd\" hook & exit /b)",
+            r#"cmd /c if exist ".grok\skills\impeccable\scripts\impeccable.cmd" ".grok\skills\impeccable\scripts\impeccable.cmd" hook"#,
         ] {
             assert!(is_impeccable_hook_command(cmd), "{cmd}");
             assert!(is_design_hook_command(cmd), "{cmd}");
@@ -212,6 +232,10 @@ mod tests {
             hook_program_token(".agents/skills/impeccable/scripts/impeccable hook").as_deref(),
             Some(".agents/skills/impeccable/scripts/impeccable")
         );
+        assert_eq!(
+            hook_program_token(&windows_launcher_hook_command(r"C:\Users\a b\.agents\skills\impeccable\scripts\impeccable", "hook")).as_deref(),
+            Some("C:/Users/a b/.agents/skills/impeccable/scripts/impeccable.cmd")
+        );
         assert_eq!(hook_program_token("'/x/it'\\''s/.claude/skills/impeccable/scripts/impeccable' hook"), None);
         assert_eq!(hook_program_token("echo hi"), None);
     }
@@ -255,5 +279,61 @@ mod tests {
             hook_program_token(single).as_deref(),
             Some("//server/share/.claude/skills/impeccable/scripts/impeccable")
         );
+    }
+}
+
+/// Removes `//` and `/* */` comments outside JSON strings, the dialect
+/// Gemini CLI reads its `settings.json` in (`strip-json-comments`). Returns
+/// the stripped text and whether any comment was removed, so a writer that
+/// cannot preserve comments knows to keep a backup.
+pub fn strip_json_comments(text: &str) -> (String, bool) {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let (mut in_string, mut escaped, mut stripped) = (false, false, false);
+    while let Some(ch) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if escaped { escaped = false } else if ch == '\\' { escaped = true } else if ch == '"' { in_string = false }
+            continue;
+        }
+        match (ch, chars.peek()) {
+            ('"', _) => { in_string = true; out.push(ch); }
+            ('/', Some('/')) => {
+                stripped = true;
+                while let Some(&c) = chars.peek() { if c == '\n' { break } chars.next(); }
+            }
+            ('/', Some('*')) => {
+                stripped = true;
+                chars.next();
+                let mut prev = '\0';
+                for c in chars.by_ref() { if prev == '*' && c == '/' { break } prev = c; }
+                out.push(' ');
+            }
+            _ => out.push(ch),
+        }
+    }
+    (out, stripped)
+}
+
+/// Parses a hook manifest that may carry comments. `None` when it is not JSON
+/// even after the comments are removed.
+pub fn parse_manifest_jsonc(text: &str) -> Option<(serde_json::Value, bool)> {
+    let (stripped, had_comments) = strip_json_comments(text);
+    serde_json::from_str(&stripped).ok().map(|v| (v, had_comments))
+}
+
+#[cfg(test)]
+mod jsonc_tests {
+    use super::*;
+
+    #[test]
+    fn strips_comments_outside_strings_only() {
+        let (v, had) = parse_manifest_jsonc("{\n // a\n \"u\": \"http://x//y\", /* b */ \"s\": \"/* no */\\\"//\"\n}").unwrap();
+        assert!(had);
+        assert_eq!(v["u"], "http://x//y");
+        assert_eq!(v["s"], "/* no */\"//");
+        assert_eq!(parse_manifest_jsonc("{\"a\": 1}").unwrap().1, false);
+        assert!(parse_manifest_jsonc("{ \"a\": ").is_none());
+        assert_eq!(crate::context_cli::hook_manifests_for("gemini"), &[".gemini/settings.json"]);
     }
 }
