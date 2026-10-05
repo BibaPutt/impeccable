@@ -159,11 +159,22 @@ impl RenderedTextCount {
         }
     }
 
-    /// An atomic inline (an image, an inline-block) sits in the line like a
+    /// Takes in an atomic inline (an image, an inline-block) whose own
+    /// contents counted `inner` characters. The box sits in the line like a
     /// character, so a collapsible space on each side of it renders: the run
-    /// ends at the box, which adds no character of its own.
-    fn end_collapsible_run(&mut self) {
+    /// ends at the box. Its contents were counted in a count of their own,
+    /// because they are laid out in their own formatting context and their
+    /// edge white space is trimmed there, never joined to the outer run.
+    fn add_atomic_inline(&mut self, inner: usize) {
         self.in_collapsible_run = false;
+        if inner == 0 {
+            return;
+        }
+        if self.count > 0 {
+            self.count += self.pending;
+        }
+        self.pending = 0;
+        self.count += inner;
     }
 }
 
@@ -198,13 +209,12 @@ fn feed_rendered_text(dom: &dyn Dom, el: ElId, out: &mut RenderedTextCount) {
                 if renders_no_text(dom, child) {
                     continue;
                 }
-                let atomic = is_atomic_inline(dom, child);
-                if atomic {
-                    out.end_collapsible_run();
-                }
-                feed_rendered_text(dom, child, out);
-                if atomic {
-                    out.end_collapsible_run();
+                if is_atomic_inline(dom, child) {
+                    let mut inner = RenderedTextCount::default();
+                    feed_rendered_text(dom, child, &mut inner);
+                    out.add_atomic_inline(inner.count);
+                } else {
+                    feed_rendered_text(dom, child, out);
                 }
             }
         }
@@ -1657,8 +1667,9 @@ mod rendered_text_tests {
         }
     }
 
-    /// An image or an empty inline-block is an atomic inline: the space on
-    /// each side of it renders, so the pair does not fold into one.
+    /// An image or an inline-block is an atomic inline: the space on each
+    /// side of it renders, so the pair does not fold into one, and a
+    /// populated box's own edge white space is trimmed inside it.
     #[test]
     fn spaces_around_an_atomic_inline_both_count() {
         let mut d = FakeDom::new();
@@ -1670,6 +1681,18 @@ mod rendered_text_tests {
             d.set_style(boxed, "display", display);
             d.add_text(r, " word");
             assert_eq!(rendered_text_len(&d, r), "word  word".len(), "{tag}");
+        }
+
+        // A populated box trims its own edge white space in its own
+        // formatting context: none of it joins the spaces outside.
+        for (tag, display) in [("span", "inline-block"), ("button", "inline-block")] {
+            let r = two_line_p(&mut d, body);
+            d.add_text(r, "word ");
+            let boxed = d.add(Some(r), tag);
+            d.set_style(boxed, "display", display);
+            d.add_text(boxed, "\n      word\n    ");
+            d.add_text(r, " word");
+            assert_eq!(rendered_text_len(&d, r), "word word word".len(), "{tag}");
         }
     }
 }
