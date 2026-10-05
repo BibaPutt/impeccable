@@ -343,6 +343,7 @@ impl Drop for SnapshotServer {
         }
     }
 }
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 fn respond(
     stream: &mut TcpStream,
     host: &str,
@@ -353,8 +354,15 @@ fn respond(
     // switch accepted streams back before write_all; otherwise large bodies
     // stop at EWOULDBLOCK and appear as valid-header/truncated-image responses.
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    // Chrome can connect and then write its request seconds later: on Windows
+    // a fresh browser's first request takes 1.5 to 3 s to go out, sometimes
+    // over 5 s, and the socket is often open well before. Closing it early
+    // made Chrome stall the navigation for about 13 s before retrying, past
+    // the capture's navigation timeout. Wait longer than any navigation
+    // timeout instead; the connection has its own thread, so waiting blocks no
+    // other request.
+    stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
     let mut bytes = Vec::new();
     let mut buf = [0u8; 1024];
     while bytes.len() <= 8192 && !bytes.windows(4).any(|x| x == b"\r\n\r\n") {

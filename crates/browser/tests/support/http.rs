@@ -37,7 +37,7 @@ where
 }
 
 fn respond(mut stream: TcpStream, handler: &dyn Fn(&str) -> Option<Response>) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     let mut request = Vec::new();
     let mut buf = [0u8; 4096];
     while !request.windows(4).any(|w| w == b"\r\n\r\n") {

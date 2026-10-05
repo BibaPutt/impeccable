@@ -28,7 +28,7 @@ fn native_capture_distinguishes_paint_from_file_presence() {
             let (transparent_response, asset, wrong) = (transparent_response.clone(), asset.clone(), wrong.clone());
             std::thread::spawn(move || {
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .set_read_timeout(Some(Duration::from_secs(60)))
                     .unwrap();
                 let mut bytes = [0u8; 4096];
                 let n = stream.read(&mut bytes).unwrap_or(0);

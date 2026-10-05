@@ -455,8 +455,12 @@ fn respond(
     // switch accepted streams back before write_all; otherwise large bodies
     // stop at EWOULDBLOCK and appear as valid-header/truncated-image responses.
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    // Chrome can connect and then write its request seconds later (see
+    // impeccable_browser::html_snapshot); closing the socket early stalls the
+    // navigation past its timeout. The connection has its own thread, so
+    // waiting longer than any navigation timeout blocks no other request.
+    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     let mut bytes = Vec::new();
     let mut buf = [0u8; 1024];
     while bytes.len() <= 8192 && !bytes.windows(4).any(|x| x == b"\r\n\r\n") {
