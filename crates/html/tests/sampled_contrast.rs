@@ -385,6 +385,15 @@ fn a_none_layer_is_skipped_and_an_unknown_one_stops() {
     // A custom function is not the url token and is not read as an image.
     let custom = ".hero { background-image: myurl(light.png); } p { color: #fdfdfd; }";
     assert!(site.contrast(custom, body).is_empty());
+    // A wrapper that paints an image function the engine does not read is
+    // not read through to the image behind it.
+    let wrapped = ".hero { background: url(light.png); } .mid { background: paint(dots); } \
+                   p { color: #fdfdfd; }";
+    let found = site.contrast(
+        wrapped,
+        "<div class=hero><div class=mid><p>White copy behind a painted wrapper</p></div></div>",
+    );
+    assert!(found.is_empty(), "{found:?}");
     // Nor is a url that is another image function's argument: which
     // candidate paints, or what the blend looks like, is not known here.
     for image in [

@@ -320,6 +320,24 @@ fn background_longhands_ride_beside_the_expansion() {
             ("backgroundImage", "none")
         ])
     );
+    // An image function the engine does not read is an image all the same:
+    // it replaces what an earlier rule set and is not cleared to `none`.
+    assert_eq!(
+        pairs("background", "#111 paint(dots)"),
+        own(&[
+            ("backgroundRepeat", "repeat"),
+            ("backgroundSize", "auto"),
+            ("backgroundImage", "#111 paint(dots)")
+        ])
+    );
+    assert_eq!(
+        pairs("background", "image-set(\"a.png\" 1x) center / cover"),
+        own(&[
+            ("backgroundRepeat", "repeat"),
+            ("backgroundSize", "cover"),
+            ("backgroundImage", "image-set(\"a.png\" 1x) center / cover")
+        ])
+    );
     // A color named after the image, which the expansion never reads. A
     // color before the image is the expansion's, and a gradient's own stops
     // are not the background color.

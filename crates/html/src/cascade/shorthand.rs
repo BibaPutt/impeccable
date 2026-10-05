@@ -338,7 +338,8 @@ fn color_outside_image(v: &str) -> Option<String> {
 /// - `backgroundImage: none` for a shorthand that names no image, which the
 ///   expansion only resets for `background: none`. Without it
 ///   `.card.plain { background: transparent }` keeps the image an earlier
-///   rule set.
+///   rule set. A shorthand whose image is a function the engine does not
+///   read stores that value, so nothing is read through it.
 /// - `backgroundColor` for a color the shorthand names after its image.
 ///
 /// A CSS-wide keyword passes through, and a bare `var()` value is left alone
@@ -381,7 +382,21 @@ fn background_shorthand_longhands(v: &str) -> Vec<Expanded> {
         ("backgroundSize".into(), size),
     ];
     if !has_image {
-        out.push(("backgroundImage".into(), "none".into()));
+        // Neither a `url()` nor a gradient. A shorthand that names no image
+        // clears it. One that names an image the engine does not read
+        // (`image-set("a.png" 1x)`, `element()`, `paint()`) replaces it with
+        // that value instead, and the sampled walk stops there.
+        let unread_image = split_css_list(v).iter().any(|layer| {
+            split_css_tokens(layer)
+                .iter()
+                .any(|token| BG_IMAGE_CALL_RE.is_match(token))
+        });
+        let image = if unread_image {
+            v.to_string()
+        } else {
+            "none".into()
+        };
+        out.push(("backgroundImage".into(), image));
     } else if let Some(color) = color_outside_image(v) {
         out.push(("backgroundColor".into(), color));
     }
