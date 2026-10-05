@@ -195,14 +195,15 @@ fn a_color_after_the_image_is_the_color_under_it() {
     // The light texture at 25% alpha over the declared #17150f is a dark
     // ground. Read without that color it composited over the white page
     // and the verdicts inverted.
-    let css =
-        |text: &str| format!(".panel {{ background: url(cutout.png) #17150f; color: {text}; }}");
     let body = "<div class=panel>Copy on the translucent texture</div>";
-    assert!(site.contrast(&css("#fdfdfd"), body).is_empty());
-    assert!(sampled_on(
-        "cutout.png",
-        &site.contrast(&css("#262421"), body)
-    ));
+    // After the image in its layer, or as the final layer of the list.
+    for background in ["url(cutout.png) #17150f", "url(cutout.png), #17150f"] {
+        let css = |text: &str| format!(".panel {{ background: {background}; color: {text}; }}");
+        let white = site.contrast(&css("#fdfdfd"), body);
+        assert!(white.is_empty(), "{background}: {white:?}");
+        let ink = site.contrast(&css("#262421"), body);
+        assert!(sampled_on("cutout.png", &ink), "{background}: {ink:?}");
+    }
 }
 
 #[test]

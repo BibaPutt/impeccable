@@ -5,7 +5,7 @@
 //! branches only (`DETECTOR_IS_BROWSER === false`).
 
 use crate::cascade::csstree::strings::{decode_string, decode_url};
-use crate::cascade::values::{css_call_end, css_string_end};
+use crate::cascade::values::{css_call_end, css_string_end, extract_static_color};
 use crate::cascade::StyleValues;
 use crate::dom::StaticElement;
 use ego_tree::NodeId;
@@ -524,6 +524,16 @@ fn gradient_stops(call: &str) -> Option<Vec<Rgba>> {
     (!stops.is_empty() && stops.len() == expected).then_some(stops)
 }
 
+/// A background layer that names a color and nothing else: the final layer
+/// of `background: url(x.png), #17150f`. An unresolved `var()` could be an
+/// image as easily as a color, so it is not one.
+fn is_color_layer(layer: &str) -> bool {
+    let var = layer
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case("var("));
+    !var && extract_static_color(layer) == layer
+}
+
 /// What one element paints behind its descendants' text, as the sampled
 /// path reads it.
 #[derive(Debug, Clone, PartialEq)]
@@ -597,9 +607,17 @@ pub fn analyze_level(cur: &StaticElement<'_>) -> LevelPaint {
             let Some(call) = UrlCall::find(bg_image, from, to) else {
                 return LevelPaint::Stop;
             };
-            let layers_beneath = spans[index + 1..].iter().any(|&(from, to)| {
+            // `none` paints nothing, and a final layer that is only a color
+            // is the element's own color, which the cascade stored as
+            // `backgroundColor`. Anything else beneath the image is paint
+            // this walk has not read.
+            let last = spans.len() - 1;
+            let layers_beneath = (index + 1..spans.len()).any(|below| {
+                let (from, to) = spans[below];
                 let rest = &bg_image[from..to];
-                !rest.is_empty() && !rest.eq_ignore_ascii_case("none")
+                !(rest.is_empty()
+                    || rest.eq_ignore_ascii_case("none")
+                    || (below == last && is_color_layer(rest)))
             });
             let font_size = js::parse_float(sv(style, "fontSize"));
             return LevelPaint::Image(ImageLayer {
@@ -798,6 +816,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_unread_paint_counts_as_a_layer_beneath_the_image() {
+        let beneath = |background: &str| -> bool {
+            let doc = document(&format!(
+                "<style>.x {{ background: {background}; }}</style><p class=x>Text</p>"
+            ));
+            let el = doc.query_selector(".x").expect("element");
+            match analyze_level(&el) {
+                LevelPaint::Image(layer) => layer.layers_beneath,
+                other => panic!("{background}: {other:?}"),
+            }
+        };
+        assert!(!beneath("url(a.png)"));
+        assert!(!beneath("url(a.png), none"));
+        // The declared color is the element's own, not unknown paint.
+        assert!(!beneath("url(a.png), #17150f"));
+        assert!(!beneath("url(a.png) no-repeat, rgba(23, 21, 15, 0.9)"));
+        assert!(beneath("url(a.png), url(b.png)"));
+        assert!(beneath("url(a.png), linear-gradient(#000, #fff)"));
+        assert!(beneath("url(a.png), url(b.png), #17150f"));
+        assert!(beneath("url(a.png), var(--below)"));
+    }
+
     fn document(html: &str) -> StaticDocument {
         let mut doc = StaticDocument::parse(html);
         let css = collect_static_css_text(&doc, Path::new("/nonexistent"), None, "x.html", None);
@@ -887,6 +928,9 @@ mod tests {
             ),
             // No image anywhere.
             (".x { color: red; }", false, None),
+            // A color as the final layer of the list is the color, in
+            // either walk.
+            (".x { background: url(a.png), #111; }", false, Some(true)),
         ] {
             assert_eq!(walks(css), (unresolved, ground), "{css}");
         }

@@ -5,12 +5,14 @@
 //! base64 data URI, never from the network. The pure-Rust decoders turn them
 //! into a raster no larger than the browser overlay's 640px canvas.
 //!
-//! The hook runs this on every edit, so nothing is done twice: an element's
-//! image is located and its header read once per document, a url that cannot
-//! be read is remembered as such, and a decoded raster is shared for the rest
-//! of the process, so a directory scan decodes each hero once. Anything
-//! unreadable, remote, oversized, or undecodable is `None`, and the caller
-//! keeps today's skip.
+//! The hook runs this on every edit, so nothing is done twice. Within a
+//! document an element's image is located once, and so is each distinct url,
+//! one that cannot be read included. Decoded pixels are shared for the rest
+//! of the process under a key that pins the bytes (a data URI's content; a
+//! file's path, size, and modification time), so a directory scan decodes
+//! each hero once and a file that changes is read again. Anything unreadable,
+//! remote, oversized, or undecodable is `None`, and the caller keeps today's
+//! skip.
 
 use crate::background::{ImageLayer, LevelCache};
 use crate::cascade::resolve_linked_css_path;
@@ -23,9 +25,9 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, Cursor, Seek};
+use std::io::{BufRead, Cursor, Read, Seek};
 use std::rc::Rc;
-use std::thread::LocalKey;
+use std::time::UNIX_EPOCH;
 
 /// The browser overlay draws to a canvas no larger than this on a side.
 const MAX_RASTER_SIDE: u32 = 640;
@@ -39,7 +41,9 @@ const MAX_IMAGE_SIDE: u32 = 8192;
 /// limit binds PNG and GIF buffers only, so the budget is checked against
 /// the header for every format: 24 megapixels is 72 MiB of RGB.
 const MAX_PIXELS: u64 = 24_000_000;
-/// Entries kept per process cache; a cache is cleared when full.
+/// The decoders' own allocation limit, where they honor one.
+const MAX_DECODE_BYTES: u64 = 128 * 1024 * 1024;
+/// Rasters kept for the process; the cache is cleared when full.
 const CACHE_ENTRIES: usize = 64;
 
 /// A decoded image, RGBA8, at most [`MAX_RASTER_SIDE`] on a side.
@@ -64,6 +68,7 @@ impl Raster {
 /// auto` paints, and it decides whether the layer is decoration before any
 /// pixel is decoded.
 pub struct ImageSource {
+    /// Names these exact bytes in the process-wide raster cache.
     key: String,
     /// The file to read, or `None` for a data URI.
     path: Option<String>,
@@ -71,24 +76,17 @@ pub struct ImageSource {
     pub height: u32,
 }
 
-type Cache<T> = RefCell<HashMap<String, Option<Rc<T>>>>;
-
 thread_local! {
-    static SOURCES: Cache<ImageSource> = RefCell::new(HashMap::new());
-    static RASTERS: Cache<Raster> = RefCell::new(HashMap::new());
+    /// Decoded pixels by [`ImageSource::key`], a failed decode included.
+    static RASTERS: RefCell<HashMap<String, Option<Rc<Raster>>>> = RefCell::new(HashMap::new());
 }
 
-/// `make()` once per key for the rest of the process, misses included.
-fn cached<T>(
-    cache: &'static LocalKey<Cache<T>>,
-    key: &str,
-    make: impl FnOnce() -> Option<T>,
-) -> Option<Rc<T>> {
-    if let Some(hit) = cache.with(|c| c.borrow().get(key).cloned()) {
+fn cached_raster(key: &str, make: impl FnOnce() -> Option<Raster>) -> Option<Rc<Raster>> {
+    if let Some(hit) = RASTERS.with(|c| c.borrow().get(key).cloned()) {
         return hit;
     }
     let value = make().map(Rc::new);
-    cache.with(|c| {
+    RASTERS.with(|c| {
         let mut cache = c.borrow_mut();
         if cache.len() >= CACHE_ENTRIES {
             cache.clear();
@@ -103,9 +101,13 @@ fn cached<T>(
 pub struct ImageSampler {
     base: String,
     levels: LevelCache,
-    /// The source behind each image-painting element, misses included, so a
-    /// page's text elements ask about their shared ancestor once.
-    sources: RefCell<HashMap<NodeId, Option<Rc<ImageSource>>>>,
+    /// The source behind each image-painting element and behind each
+    /// distinct url of this document, misses included: a page's text
+    /// elements share their ancestors, and its cards share their images.
+    /// Neither outlives the document, so a file that appears between two
+    /// scans is found by the second.
+    by_node: RefCell<HashMap<NodeId, Option<Rc<ImageSource>>>>,
+    by_url: RefCell<HashMap<String, Option<Rc<ImageSource>>>>,
 }
 
 impl ImageSampler {
@@ -113,7 +115,8 @@ impl ImageSampler {
         ImageSampler {
             base: html_dir.to_string(),
             levels: LevelCache::default(),
-            sources: RefCell::new(HashMap::new()),
+            by_node: RefCell::new(HashMap::new()),
+            by_url: RefCell::new(HashMap::new()),
         }
     }
 
@@ -130,11 +133,11 @@ impl ImageSampler {
         node: NodeId,
         layer: &ImageLayer,
     ) -> Option<Rc<ImageSource>> {
-        if let Some(hit) = self.sources.borrow().get(&node) {
+        if let Some(hit) = self.by_node.borrow().get(&node) {
             return hit.clone();
         }
         let found = self.find_source(&layer_url(doc, node, layer));
-        self.sources.borrow_mut().insert(node, found.clone());
+        self.by_node.borrow_mut().insert(node, found.clone());
         found
     }
 
@@ -146,7 +149,7 @@ impl ImageSampler {
         layer: &ImageLayer,
         source: &ImageSource,
     ) -> Option<Rc<Raster>> {
-        cached(&RASTERS, &source.key, || {
+        cached_raster(&source.key, || {
             decode(&source_bytes(source, &layer_url(doc, node, layer))?)
         })
     }
@@ -156,45 +159,71 @@ impl ImageSampler {
         if url.is_empty() {
             return None;
         }
-        if is_data_uri(url) {
+        let data = is_data_uri(url);
+        if data {
             // Refused before anything is allocated: a project file can carry
             // any size of data URI.
             if url.len() > MAX_DATA_URI_CHARS + 256 {
                 return None;
             }
-            let key = data_uri_key(url);
-            return cached(&SOURCES, &key, || {
-                let (width, height) = dimensions(Cursor::new(data_uri_bytes(url)?))?;
-                Some(ImageSource {
-                    key: key.clone(),
-                    path: None,
-                    width,
-                    height,
-                })
-            });
-        }
-        if url.starts_with("//") || url.contains("://") {
+        } else if url.starts_with("//") || url.contains("://") {
             return None;
         }
-        // Keyed on the url as written, so a url that does not resolve costs
-        // its directory walk once, not once per text element.
-        let lookup = format!("{}\u{0}{}", self.base, url);
-        cached(&SOURCES, &lookup, || {
-            let path = resolve_linked_css_path(&self.base, url);
-            let meta = std::fs::metadata(&path).ok()?;
-            if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-                return None;
-            }
-            let file = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
-            let (width, height) = dimensions(file)?;
-            Some(ImageSource {
-                key: path.clone(),
-                path: Some(path),
-                width,
-                height,
-            })
-        })
+        // A data URI is known by its content, a file url by how it is
+        // written, so one that does not resolve costs its directory walk
+        // once per document, not once per element.
+        let lookup: Cow<str> = if data {
+            Cow::Owned(data_uri_key(url))
+        } else {
+            Cow::Borrowed(url)
+        };
+        if let Some(hit) = self.by_url.borrow().get(lookup.as_ref()) {
+            return hit.clone();
+        }
+        let found = if data {
+            data_source(url, &lookup)
+        } else {
+            file_source(&self.base, url)
+        }
+        .map(Rc::new);
+        self.by_url
+            .borrow_mut()
+            .insert(lookup.into_owned(), found.clone());
+        found
     }
+}
+
+fn data_source(url: &str, key: &str) -> Option<ImageSource> {
+    let (width, height) = dimensions(Cursor::new(data_uri_bytes(url)?))?;
+    Some(ImageSource {
+        key: key.to_string(),
+        path: None,
+        width,
+        height,
+    })
+}
+
+fn file_source(base: &str, url: &str) -> Option<ImageSource> {
+    let path = resolve_linked_css_path(base, url);
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let file = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
+    let (width, height) = dimensions(file)?;
+    // The raster cache outlives this document, so the key carries what
+    // changes when the file does.
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    Some(ImageSource {
+        key: format!("{path}\u{0}{}\u{0}{modified}", meta.len()),
+        path: Some(path),
+        width,
+        height,
+    })
 }
 
 /// The url of an element's image layer, borrowed from its computed style.
@@ -213,26 +242,15 @@ fn is_data_uri(url: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
 }
 
-/// The cache key of a data URI: its length and a hash of bounded windows of
-/// it (head, tail, and evenly spaced slices), so a multi-megabyte inlined
-/// image costs a few kilobytes of hashing and the cache never holds a copy.
+/// The cache key of a data URI: its length and a hash of every byte, so two
+/// images never share a key by differing only where a sample did not look.
+/// It is computed once per image element per document (the sampler
+/// remembers the element), which is one pass over a multi-megabyte inlined
+/// image, and the cache never holds a copy.
 fn data_uri_key(url: &str) -> String {
-    const EDGE: usize = 2048;
-    const SLICES: usize = 16;
-    const SLICE: usize = 64;
-    let bytes = url.as_bytes();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    if bytes.len() <= EDGE * 4 {
-        bytes.hash(&mut hasher);
-    } else {
-        bytes[..EDGE].hash(&mut hasher);
-        bytes[bytes.len() - EDGE..].hash(&mut hasher);
-        let step = bytes.len() / (SLICES + 1);
-        for i in 1..=SLICES {
-            bytes[i * step..i * step + SLICE].hash(&mut hasher);
-        }
-    }
-    format!("data:{}:{:016x}", bytes.len(), hasher.finish())
+    url.as_bytes().hash(&mut hasher);
+    format!("data:{}:{:016x}", url.len(), hasher.finish())
 }
 
 /// The name a finding gives the image: the file name, or `data:<mime>`.
@@ -258,9 +276,21 @@ pub fn ground_label(url: &str) -> String {
 
 fn source_bytes(source: &ImageSource, url: &str) -> Option<Vec<u8>> {
     match &source.path {
-        Some(path) => std::fs::read(path).ok(),
+        Some(path) => read_bounded(path),
         None => data_uri_bytes(url.trim()),
     }
+}
+
+/// The file's bytes, refused past [`MAX_FILE_BYTES`] whatever its size was
+/// when the header was read.
+fn read_bounded(path: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_FILE_BYTES).then_some(bytes)
 }
 
 fn data_uri_bytes(url: &str) -> Option<Vec<u8>> {
@@ -302,11 +332,18 @@ fn dimensions<R: BufRead + Seek>(reader: R) -> Option<(u32, u32)> {
 }
 
 fn decode(bytes: &[u8]) -> Option<Raster> {
-    let decoded = image::ImageReader::new(Cursor::new(bytes))
+    // The budget is checked on the bytes being decoded, whatever a header
+    // said earlier, and the decoders get their own limits besides.
+    dimensions(Cursor::new(bytes))?;
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
-        .ok()?
-        .decode()
         .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    reader.limits(limits);
+    let decoded = reader.decode().ok()?;
     // `thumbnail` also upscales, so only images past the budget go through it.
     let scaled = if decoded.width().max(decoded.height()) > MAX_RASTER_SIDE {
         decoded.thumbnail(MAX_RASTER_SIDE, MAX_RASTER_SIDE)
@@ -336,9 +373,7 @@ mod tests {
 
     fn raster(sampler: &ImageSampler, url: &str) -> Option<Rc<Raster>> {
         let source = sampler.find_source(url)?;
-        cached(&RASTERS, &source.key, || {
-            decode(&source_bytes(&source, url)?)
-        })
+        cached_raster(&source.key, || decode(&source_bytes(&source, url)?))
     }
 
     #[test]
@@ -379,15 +414,18 @@ mod tests {
     }
 
     #[test]
-    fn a_long_data_uri_is_fingerprinted_from_bounded_windows() {
+    fn a_data_uri_key_covers_every_byte() {
         let head = "data:image/png;base64,";
         let a = format!("{head}{}", "A".repeat(60_000));
-        let mut b = a.clone().into_bytes();
-        // A change inside one of the sampled slices changes the key.
-        let step = b.len() / 17;
-        b[step + 3] = b'B';
-        let b = String::from_utf8(b).unwrap();
-        assert_ne!(data_uri_key(&a), data_uri_key(&b));
+        // One byte anywhere changes the key, wherever it sits.
+        for at in [head.len(), 2_148, 30_000, a.len() - 1] {
+            let mut b = a.clone().into_bytes();
+            b[at] = b'B';
+            assert_ne!(
+                data_uri_key(&a),
+                data_uri_key(&String::from_utf8(b).unwrap())
+            );
+        }
         assert_ne!(data_uri_key(&a), data_uri_key(&format!("{a}A")));
         assert_eq!(data_uri_key(&a), data_uri_key(&a.clone()));
     }
@@ -401,11 +439,8 @@ mod tests {
             png_bytes(1280, 320, [20, 20, 20, 255]),
         )
         .unwrap();
-        let sampler = ImageSampler::new(&dir.to_string_lossy());
-        assert!(sampler.find_source("wide.png").is_none());
-        // The miss is remembered: the file appearing later does not change
-        // the answer within one process.
-        std::fs::write(dir.join("wide.png"), png_bytes(4, 4, [0, 0, 0, 255])).unwrap();
+        let base = dir.to_string_lossy().into_owned();
+        let sampler = ImageSampler::new(&base);
         assert!(sampler.find_source("wide.png").is_none());
         let source = sampler
             .find_source("img/wide.png")
@@ -419,6 +454,23 @@ mod tests {
             &pixels,
             &raster(&sampler, "img/wide.png").unwrap()
         ));
+
+        // A miss is remembered for the document, so the walk runs once, and
+        // forgotten with it: the next scan finds a file that has appeared.
+        std::fs::write(dir.join("wide.png"), png_bytes(4, 4, [0, 0, 0, 255])).unwrap();
+        assert!(sampler.find_source("wide.png").is_none());
+        let next = ImageSampler::new(&base);
+        assert!(next.find_source("wide.png").is_some());
+        // The process keeps the decoded pixels, but under a key that follows
+        // the file: one that changed is decoded again.
+        assert!(Rc::ptr_eq(&pixels, &raster(&next, "img/wide.png").unwrap()));
+        std::fs::write(
+            dir.join("img").join("wide.png"),
+            png_bytes(64, 32, [200, 200, 200, 255]),
+        )
+        .unwrap();
+        let changed = raster(&ImageSampler::new(&base), "img/wide.png").unwrap();
+        assert_eq!((changed.width, changed.pixel(0, 0).g), (64, 200.0));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -427,6 +479,9 @@ mod tests {
         // 6000 x 6000 is 36 megapixels: over the budget, and never decoded.
         let big = png_bytes(6000, 6000, [0, 0, 0, 255]);
         assert!(dimensions(Cursor::new(&big)).is_none());
+        // The same budget holds at the decode itself, whatever a header
+        // said when the source was located.
+        assert!(decode(&big).is_none());
         let ok = png_bytes(4000, 3000, [0, 0, 0, 255]);
         assert_eq!(dimensions(Cursor::new(&ok)), Some((4000, 3000)));
     }
