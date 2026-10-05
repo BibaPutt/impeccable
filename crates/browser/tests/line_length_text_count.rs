@@ -94,15 +94,14 @@ fn findings(engine: &BrowserEngine, port: u16, rule: &str) -> Vec<String> {
 /// their snippets: each group of twins reports one snippet as many times as
 /// it has members. The wide column and its two cases are a group of three,
 /// the `pre-wrap` paragraph and the normal one with a `pre-wrap` span a group
-/// of two, and the plain measure and its three cases a group of four when a
-/// narrow host font makes a 560px measure long enough to flag at all. A case
-/// that counts something its twin does not reports a snippet of its own and
-/// shrinks its group, which is what this catches: counted from
-/// `textContent`, every case read differently from its twin (the style
-/// child's CSS, the hidden child and the script, and the indentation were
-/// charged to the lines, and the span's runs of spaces were folded away).
-/// A lone snippet belongs to no group and is left out of the comparison: the
-/// Devanagari paragraph has no twin, and whether it flags is up to the font.
+/// of two, and the plain measure and its four cases a group of five when a
+/// narrow host font makes a 560px measure long enough to flag at all. Every
+/// finding has to belong to one of those groups: a case that counts
+/// something its twin does not reports a snippet of its own, or flags where
+/// its twin does not, and either one changes the groups. Counted from
+/// `textContent`, no case read what its twin reads (the style child's CSS,
+/// the hidden children and the script, and the indentation were charged to
+/// the lines, and the span's runs of spaces were folded away).
 #[test]
 fn line_length_counts_the_characters_on_the_lines() {
     let Some(engine) = engine() else { return };
@@ -112,10 +111,10 @@ fn line_length_counts_the_characters_on_the_lines() {
     for snippet in &found {
         *groups.entry(snippet.as_str()).or_default() += 1;
     }
-    let mut sizes: Vec<usize> = groups.values().copied().filter(|n| *n > 1).collect();
+    let mut sizes: Vec<usize> = groups.values().copied().collect();
     sizes.sort_unstable_by(|a, b| b.cmp(a));
     assert!(
-        sizes == [3, 2] || sizes == [4, 3, 2],
-        "each case reads as its plain twin: {found:?}"
+        sizes == [3, 2] || sizes == [5, 3, 2],
+        "every finding belongs to a group of twins that read alike: {found:?}"
     );
 }
