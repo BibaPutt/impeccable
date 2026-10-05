@@ -326,7 +326,7 @@ matcher) skip `text-{gray,slate,zinc,neutral,stone}-N` for N of 700 and up the
 same way. No existing fixture finding moved; the goldens below change only
 because of the new `gray-on-color.html` fixture.
 
-- New cases `detect-fixture-json-gray-on-color-html` and `detect-fixture-text-gray-on-color-html`: the fixture's five should-flag rows report (`#d1d5db` on `#1e3a8a` and on `#115e59`, `text-gray-400 on bg-blue-600`, `#4b5563` on `#fcd34d`, `text-gray-600 on bg-amber-400`); its four should-pass rows do not (`#e5e7eb` on `#1e3a8a`, `#393939` on `#ffc224`, `#413c38` on `#38e07b`, `text-gray-800` on `bg-yellow-400`). The released 0.1.11 engine reports the last three as well.
+- New cases `detect-fixture-json-gray-on-color-html` and `detect-fixture-text-gray-on-color-html`: the fixture's five should-flag rows report (`#d1d5db` on `#1e3a8a` and on `#115e59`, `text-gray-400 on bg-blue-600`, `#4b5563` on `#fcd34d`, `text-gray-600 on bg-amber-400`); its five should-pass rows do not (`#e5e7eb` on `#1e3a8a`, `#393939` on `#ffc224`, `#413c38` on `#38e07b`, `text-gray-800` on `bg-yellow-400`, `#4b5563` on the neutral `#f3f4f6`). The released 0.1.11 engine reports the last three as well.
 - The sweeps `detect-dir-text-all-fixtures`, `detect-dir-quiet-all-fixtures`, `detect-no-advisory-json` and `detect-no-advisory-text` gain the same five findings (420 to 425 counted). Nothing else moved. `detect-dir-json-all-fixtures` was left unrecorded: it is already an accepted delta and a fresh recording also carries unrelated drift.
 
 ### Known limits
