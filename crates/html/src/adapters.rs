@@ -469,6 +469,35 @@ fn static_edge_hugs(value: &str) -> bool {
     n.is_finite() && n.abs() <= 2.0
 }
 
+/// A width in px for the absolute CSS units (plus rem/em at 16px). `8%` or
+/// `10vw` depends on a box the static engine does not lay out, so it is `None`.
+fn static_stripe_width_px(value: &str) -> Option<f64> {
+    if let Some(px) = css_length_to_px(value) {
+        return Some(px);
+    }
+    let v = js::to_lower_case(js::trim(value));
+    let split = v.find(|c: char| c.is_ascii_alphabetic())?;
+    let n: f64 = v[..split].parse().ok()?;
+    let per_unit = match &v[split..] {
+        "pt" => 96.0 / 72.0,
+        "pc" => 16.0,
+        "in" => 96.0,
+        "cm" => 96.0 / 2.54,
+        "mm" => 96.0 / 25.4,
+        "q" => 96.0 / 101.6,
+        _ => return None,
+    };
+    Some(n * per_unit)
+}
+
+/// The first value token of a computed longhand that a shorthand or `var()`
+/// may have filled with a whole list (`wrap column`, `center stretch`).
+fn first_keyword<'a>(value: &'a str, allowed: &[&str]) -> Option<&'a str> {
+    value
+        .split_ascii_whitespace()
+        .find(|t| allowed.is_empty() || allowed.contains(t))
+}
+
 /// JS: checks.mjs#checkElementStripeChild(el, style)
 pub fn check_element_stripe_child(el: &StaticElement<'_>, style: &StyleValues) -> Vec<RuleHit> {
     let tag = el.tag_lower();
@@ -494,8 +523,7 @@ pub fn check_element_stripe_child(el: &StaticElement<'_>, style: &StyleValues) -
         return Vec::new();
     }
 
-    // Only absolute lengths count: `8%` or `10vw` is not a pixel width.
-    let width = css_length_to_px(sv(style, "width")).unwrap_or(0.0);
+    let width = static_stripe_width_px(sv(style, "width")).unwrap_or(0.0);
     let position = js::to_lower_case(sv(style, "position"));
     let height_raw = js::to_lower_case(sv(style, "height"));
     // Height is not inherited, so initial and unset both reset it to auto.
@@ -524,15 +552,19 @@ pub fn check_element_stripe_child(el: &StaticElement<'_>, style: &StyleValues) -
         if !pdisplay.contains("flex") {
             return Vec::new();
         }
-        let pdir = sv(host_style, "flexDirection");
+        let pdir = first_keyword(
+            sv(host_style, "flexDirection"),
+            &["row", "row-reverse", "column", "column-reverse"],
+        )
+        .unwrap_or("row");
         if pdir.starts_with("column") {
             return Vec::new();
         }
-        let align_self = sv(style, "alignSelf");
+        let align_self = first_keyword(sv(style, "alignSelf"), &[]).unwrap_or("");
         let effective_align = if !align_self.is_empty() && align_self != "auto" {
             align_self
         } else {
-            sv(host_style, "alignItems")
+            first_keyword(sv(host_style, "alignItems"), &[]).unwrap_or("")
         };
         let is_stretch = effective_align.is_empty()
             || effective_align == "stretch"

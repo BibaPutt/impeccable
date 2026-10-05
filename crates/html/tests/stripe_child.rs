@@ -213,11 +213,11 @@ fn row_reverse_first_child_is_right() {
 
 #[test]
 fn relative_widths_are_not_pixel_stripes() {
-    for width in ["8%", "10vw", "4px"] {
+    for width in ["8%", "10vw", "4px", "3pt", "1mm"] {
         let html = format!(r#"<html><body><div style="position:relative;width:320px;height:100px">
 <div style="position:absolute;inset:0 auto 0 0;width:{width};background:#3b82f6"></div>
 </div></body></html>"#);
-        let expected = usize::from(width == "4px");
+        let expected = usize::from(!width.ends_with('%') && !width.ends_with("vw"));
         assert_eq!(side_tab_snippets(&html).len(), expected, "width {width}");
     }
 }
@@ -234,4 +234,24 @@ fn flex_shorthands_set_direction_and_alignment() {
     assert!(side_tab_snippets(&page("", "place-self:center;")).is_empty());
     assert_eq!(side_tab_snippets(&page("flex-flow:wrap;", "")).len(), 1);
     assert_eq!(side_tab_snippets(&page("flex-direction:column;flex-flow:wrap;", "")).len(), 1);
+}
+
+#[test]
+fn flex_shorthands_resolve_var_and_inherit_per_longhand() {
+    let page = |vars: &str, host: &str| {
+        format!(r#"<html><body><div style="{vars}">
+<div style="display:flex;{host}width:320px;height:100px">
+<div>Content</div><div style="width:4px;background:#f59e0b"></div>
+</div></div></body></html>"#)
+    };
+    // The stripe is the last child: right edge in a row, left in row-reverse.
+    let reversed = side_tab_snippets(&page("--flow:wrap row-reverse;", "flex-flow:var(--flow);"));
+    assert_eq!(reversed.len(), 1);
+    assert!(reversed[0].contains("stripe child (left)"), "{reversed:?}");
+    assert!(side_tab_snippets(&page("--flow:column;", "flex-flow:var(--flow);")).is_empty());
+    assert!(side_tab_snippets(&page("--align:center;", "place-items:var(--align);")).is_empty());
+    let inherited = page("display:flex;flex-direction:row-reverse;", "flex-flow:inherit;");
+    let inherited = side_tab_snippets(&inherited);
+    assert_eq!(inherited.len(), 1);
+    assert!(inherited[0].contains("stripe child (left)"), "{inherited:?}");
 }

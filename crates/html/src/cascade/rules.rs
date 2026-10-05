@@ -257,6 +257,22 @@ fn extra_specified_expansions(prop: &str, value: &str) -> Vec<Expanded> {
         "flex-direction" => vec![("flexDirection".into(), v.to_string())],
         "align-items" => vec![("alignItems".into(), v.to_string())],
         "align-self" => vec![("alignSelf".into(), v.to_string())],
+        // `var()` and CSS-wide keywords resolve later, per longhand; the
+        // stripe adapter picks the keyword out of the resolved list.
+        "flex-flow" | "place-items" | "place-self"
+            if v.contains("var(")
+                || matches!(
+                    js::to_lower_case(v).as_str(),
+                    "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+                ) =>
+        {
+            let longhand = match p.as_str() {
+                "flex-flow" => "flexDirection",
+                "place-items" => "alignItems",
+                _ => "alignSelf",
+            };
+            vec![(longhand.into(), v.to_string())]
+        }
         // Shorthands reset what they omit: `flex-flow: wrap` is a row.
         "flex-flow" => {
             let direction = split_css_tokens(v)
