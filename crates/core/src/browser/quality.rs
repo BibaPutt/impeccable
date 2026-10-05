@@ -1618,5 +1618,18 @@ mod rendered_text_tests {
         d.add_text(unknown, "kept ");
         d.add_text(q, "after");
         assert_eq!(rendered_text_len(&d, q), "Before kept after".len());
+
+        // content-visibility does not apply to a plain inline box or to
+        // display: contents, so their text renders and counts.
+        for display in ["inline", "contents"] {
+            let r = two_line_p(&mut d, body);
+            d.add_text(r, "Before ");
+            let inline = d.add(Some(r), "span");
+            d.set_style(inline, "display", display);
+            d.set_style(inline, "contentVisibility", "hidden");
+            d.add_text(inline, "shown ");
+            d.add_text(r, "after");
+            assert_eq!(rendered_text_len(&d, r), "Before shown after".len(), "{display}");
+        }
     }
 }

@@ -297,6 +297,10 @@ pub const UNRENDERED_TEXT_TAGS: [&str; 4] = ["style", "script", "noscript", "tem
 /// A descendant whose text is on no line: a `<style>`, `<script>`,
 /// `<noscript>` or `<template>`, a `display: none` box, and a
 /// `content-visibility: hidden` box (the box lays out, its contents do not).
+/// `content-visibility` applies only where layout containment does, so a
+/// plain inline box, `display: contents`, and internal table and ruby boxes
+/// render their text whatever the property says
+/// ([`content_visibility_applies`]).
 ///
 /// One definition for both sides of `line-length`: the characters it counts
 /// and the line rects it divides them among skip the same subtrees, so the
@@ -305,7 +309,33 @@ pub const UNRENDERED_TEXT_TAGS: [&str; 4] = ["style", "script", "noscript", "tem
 pub fn renders_no_text(dom: &dyn Dom, el: ElId) -> bool {
     UNRENDERED_TEXT_TAGS.contains(&tag_lower(dom, el).as_str())
         || dom.style(el, "display") == "none"
-        || crate::js::to_lower_case(&dom.style(el, "contentVisibility")) == "hidden"
+        || (crate::js::to_lower_case(&dom.style(el, "contentVisibility")) == "hidden"
+            && content_visibility_applies(&dom.style(el, "display")))
+}
+
+/// Displays whose box takes layout containment, which is the condition for
+/// `content-visibility` to have any effect (CSS Containment 2: containment
+/// does not apply to non-atomic inline boxes, internal table boxes other
+/// than table cells, or internal ruby boxes; `display: contents` makes no
+/// box at all). An unknown display (`""`) counts as applying.
+pub fn content_visibility_applies(display: &str) -> bool {
+    !matches!(
+        crate::js::to_lower_case(display).trim(),
+        "inline"
+            | "inline flow"
+            | "contents"
+            | "table-row"
+            | "table-row-group"
+            | "table-header-group"
+            | "table-footer-group"
+            | "table-column"
+            | "table-column-group"
+            | "ruby"
+            | "ruby-base"
+            | "ruby-text"
+            | "ruby-base-container"
+            | "ruby-text-container"
+    )
 }
 
 /// `el.getAttribute('class') || ''`.
