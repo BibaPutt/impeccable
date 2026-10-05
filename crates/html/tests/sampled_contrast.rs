@@ -129,12 +129,31 @@ fn a_label_replaced_by_its_image_is_not_measured() {
         let found = site.contrast(&format!("{banner} {hide}"), body);
         assert!(found.is_empty(), "{hide} {body}: {found:?}");
     }
-    // An ordinary indent is still text on the image.
-    let indented = site.contrast(
-        &format!("{banner} .banner {{ text-indent: 2em; }}"),
-        "<h1 class=banner>Acme Tools</h1>",
-    );
-    assert!(sampled_on("dark.png", &indented), "{indented:?}");
+    for (shown, body) in [
+        // An ordinary indent is still text on the image.
+        (
+            ".banner { text-indent: 2em; }",
+            "<h1 class=banner>Acme Tools</h1>",
+        ),
+        // text-indent inherits, so a child that resets it is visible again.
+        (
+            ".banner { text-indent: -9999px; } .banner p { text-indent: 0; }",
+            "<div class=banner><p>Acme Tools</p></div>",
+        ),
+        // `100%` moves the first line only: where the text may wrap, or
+        // nothing clips it, the rest is still there to read.
+        (
+            ".banner { text-indent: 100%; overflow: hidden; }",
+            "<h1 class=banner>Acme Tools</h1>",
+        ),
+        (
+            ".banner { text-indent: 100%; white-space: nowrap; }",
+            "<h1 class=banner>Acme Tools</h1>",
+        ),
+    ] {
+        let found = site.contrast(&format!("{banner} {shown}"), body);
+        assert!(sampled_on("dark.png", &found), "{shown} {body}: {found:?}");
+    }
 }
 
 #[test]

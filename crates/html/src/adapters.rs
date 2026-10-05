@@ -674,11 +674,16 @@ fn sampled_image_contrast(
 
 /// Text hidden on purpose over the image that stands in for it: a
 /// visually-hidden label, `font-size: 0`, or a `text-indent` that throws the
-/// text out of its box (`-9999px`, or `100%` under `overflow: hidden`)
-/// declared anywhere from the text up to the image. The image is the label,
-/// so there is no contrast to measure. A browser can tell by the boxes (the
-/// DOM path never measures one under 10px); a file scan has none and goes by
-/// the declarations that make them.
+/// whole text out of its box. The image is the label, so there is no
+/// contrast to measure. A browser can tell by the boxes (the DOM path never
+/// measures one under 10px); a file scan has none and goes by the
+/// declarations that make them.
+///
+/// `text-indent` inherits, so the nearest declaration from the text up to
+/// the image is the one that applies: a child that resets it is visible
+/// again. `-9999px` stretches the first line far enough to take all of the
+/// text with it. `100%` only moves the first line, so it hides the text
+/// only where nothing wraps and the overflow is clipped.
 fn replaced_by_its_image(el: &StaticElement<'_>, image: ego_tree::NodeId) -> bool {
     let style = el.style();
     if is_visually_hidden(el, style) || parse_float(sv(style, "fontSize")) == 0.0 {
@@ -688,12 +693,13 @@ fn replaced_by_its_image(el: &StaticElement<'_>, image: ego_tree::NodeId) -> boo
     while let Some(cur) = current {
         let style = cur.style();
         let indent = js::trim(sv(style, "textIndent"));
-        let thrown_left = parse_float(indent) <= -999.0;
-        let pushed_out = indent.ends_with('%')
-            && parse_float(indent) >= 100.0
-            && matches!(sv(style, "overflow"), "hidden" | "clip");
-        if thrown_left || pushed_out {
-            return true;
+        if !indent.is_empty() {
+            let amount = parse_float(indent);
+            let pushed_out = indent.ends_with('%')
+                && amount >= 100.0
+                && sv(style, "whiteSpace") == "nowrap"
+                && matches!(sv(style, "overflow"), "hidden" | "clip");
+            return amount <= -999.0 || pushed_out;
         }
         if cur.id() == image {
             break;
