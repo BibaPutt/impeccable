@@ -260,7 +260,7 @@ fn extra_specified_expansions(prop: &str, value: &str) -> Vec<Expanded> {
         // `var()` and CSS-wide keywords resolve later, per longhand; the
         // stripe adapter picks the keyword out of the resolved list.
         "flex-flow" | "place-items" | "place-self"
-            if v.contains("var(")
+            if js::to_lower_case(v).contains("var(")
                 || matches!(
                     js::to_lower_case(v).as_str(),
                     "inherit" | "initial" | "unset" | "revert" | "revert-layer"

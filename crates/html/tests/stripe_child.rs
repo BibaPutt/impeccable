@@ -249,6 +249,8 @@ fn flex_shorthands_resolve_var_and_inherit_per_longhand() {
     assert_eq!(reversed.len(), 1);
     assert!(reversed[0].contains("stripe child (left)"), "{reversed:?}");
     assert!(side_tab_snippets(&page("--flow:column;", "flex-flow:var(--flow);")).is_empty());
+    assert!(side_tab_snippets(&page("--flow:COLUMN;", "flex-flow:VAR(--flow);")).is_empty());
+    assert!(side_tab_snippets(&page("--align:Center;", "place-items:Var(--align);")).is_empty());
     assert!(side_tab_snippets(&page("--align:center;", "place-items:var(--align);")).is_empty());
     let inherited = page("display:flex;flex-direction:row-reverse;", "flex-flow:inherit;");
     let inherited = side_tab_snippets(&inherited);

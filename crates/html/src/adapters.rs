@@ -492,10 +492,11 @@ fn static_stripe_width_px(value: &str) -> Option<f64> {
 
 /// The first value token of a computed longhand that a shorthand or `var()`
 /// may have filled with a whole list (`wrap column`, `center stretch`).
-fn first_keyword<'a>(value: &'a str, allowed: &[&str]) -> Option<&'a str> {
+fn first_keyword(value: &str, allowed: &[&str]) -> Option<String> {
     value
         .split_ascii_whitespace()
-        .find(|t| allowed.is_empty() || allowed.contains(t))
+        .map(js::to_lower_case)
+        .find(|t| allowed.is_empty() || allowed.contains(&t.as_str()))
 }
 
 /// JS: checks.mjs#checkElementStripeChild(el, style)
@@ -556,15 +557,15 @@ pub fn check_element_stripe_child(el: &StaticElement<'_>, style: &StyleValues) -
             sv(host_style, "flexDirection"),
             &["row", "row-reverse", "column", "column-reverse"],
         )
-        .unwrap_or("row");
+        .unwrap_or_else(|| "row".to_string());
         if pdir.starts_with("column") {
             return Vec::new();
         }
-        let align_self = first_keyword(sv(style, "alignSelf"), &[]).unwrap_or("");
+        let align_self = first_keyword(sv(style, "alignSelf"), &[]).unwrap_or_default();
         let effective_align = if !align_self.is_empty() && align_self != "auto" {
             align_self
         } else {
-            first_keyword(sv(host_style, "alignItems"), &[]).unwrap_or("")
+            first_keyword(sv(host_style, "alignItems"), &[]).unwrap_or_default()
         };
         let is_stretch = effective_align.is_empty()
             || effective_align == "stretch"
