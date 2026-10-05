@@ -105,6 +105,15 @@ fn is_comp_round_comp(path: &str) -> bool {
     dir == ".impeccable/mocks" || dir.ends_with("/.impeccable/mocks")
 }
 
+/// The comp round's option one: the decision comp `build-phase start
+/// --decision-comp` recorded, while that build's comps phase is open. A pick
+/// of it in the comp round is the approval, not a new option one.
+fn is_open_rounds_decision_comp(cwd: &str, path: &str) -> bool {
+    let Some(state) = safe_read(&jsp::resolve(cwd, &[".impeccable/build/state.json"])).and_then(|raw| serde_json::from_str::<Value>(&raw).ok()) else { return false };
+    let Some(chosen) = state.get("decisionComp").and_then(Value::as_str) else { return false };
+    state.get("phase").and_then(Value::as_str) == Some("comps") && same_path(&jsp::resolve(cwd, &[chosen]), &jsp::resolve(cwd, &[path]))
+}
+
 fn print_answer(io: &mut Io, raw: &str) {
     io.out(&format!("ANSWER: {}\n", raw));
     let Ok(a) = serde_json::from_str::<Value>(raw) else { return };
@@ -112,10 +121,12 @@ fn print_answer(io: &mut Io, raw: &str) {
     if truthy("hero") || truthy("board") {
         io.out("CHOSEN CARD: open the chosen world's board and hero images now, before any code. When your harness only reads files, or runs sandboxed, download them INTO the workspace and open the relative path; a sandboxed viewer rejects absolute paths outside it. They set the craft bar the build must reach.\n");
     }
-    if truthy("comp") && is_comp_round_comp(&a.get("comp").map(js_str).unwrap_or_default()) {
+    let comp = a.get("comp").map(js_str).unwrap_or_default();
+    let cwd = io.cwd.to_string_lossy().to_string();
+    if truthy("comp") && (is_comp_round_comp(&comp) || is_open_rounds_decision_comp(&cwd, &comp)) {
         io.out("APPROVED COMP: the user picked this composition in the comp round, so it is the approved comp. Set \"approved\": true in its prompt sidecar, the image's full file name plus .json (a.png gets a.png.json), record its path in the surface brief, then close the comps phase with build-phase advance. Build from it as it stands; never regenerate it.\n");
     } else if truthy("comp") {
-        io.out("CHOSEN COMP: the decision comp at that path is compositional option one. On a comp-led build the comp round adds two variations beside it; on a code-led build it returns at the finish review as the critique reference. Never regenerate it from scratch.\n");
+        io.out("CHOSEN COMP: the decision comp at that path is compositional option one. On a comp-led build pass it to build-phase start as --decision-comp <that path>, and the comp round adds two variations beside it where it stands; on a code-led build it returns at the finish review as the critique reference. Never regenerate it from scratch.\n");
     }
     let option_id = a.get("optionId").and_then(|v| v.as_str());
     if option_id == Some("canon") {
@@ -2148,7 +2159,31 @@ mod tests {
 
         let out = answer_lines(r#"{"optionId":"a","steer":"","comp":".impeccable/mocks/decision/a.png"}"#);
         assert!(out.contains("CHOSEN COMP: the decision comp at that path is compositional option one."), "{out}");
+        assert!(out.contains("--decision-comp <that path>"), "{out}");
         assert!(!out.contains("APPROVED COMP"), "{out}");
+    }
+
+    #[test]
+    fn comp_round_pick_of_the_recorded_decision_comp_is_the_approval() {
+        let dir = std::env::temp_dir().join(format!("impeccable-sq-decision-{}-{}", std::process::id(), now_ms() as u64));
+        std::fs::create_dir_all(dir.join(".impeccable/build")).unwrap();
+        let answer = |raw: &str| {
+            let (mut io, cap) = Io::captured("", dir.clone(), Env::new());
+            print_answer(&mut io, raw);
+            let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+            out
+        };
+        let state = |phase: &str| json!({ "phase": phase, "decisionComp": ".impeccable/mocks/decision/a.png" }).to_string();
+        std::fs::write(dir.join(".impeccable/build/state.json"), state("comps")).unwrap();
+        let out = answer(r#"{"optionId":"one","comp":"./.impeccable/mocks/decision/a.png"}"#);
+        assert!(out.contains("APPROVED COMP") && !out.contains("CHOSEN COMP"), "{out}");
+        // Another decision comp, or the same one once the round closed, stays a decision pick.
+        let out = answer(r#"{"optionId":"b","comp":".impeccable/mocks/decision/b.png"}"#);
+        assert!(out.contains("CHOSEN COMP") && !out.contains("APPROVED COMP"), "{out}");
+        std::fs::write(dir.join(".impeccable/build/state.json"), state("spec")).unwrap();
+        let out = answer(r#"{"optionId":"one","comp":".impeccable/mocks/decision/a.png"}"#);
+        assert!(out.contains("CHOSEN COMP") && !out.contains("APPROVED COMP"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
