@@ -99,10 +99,10 @@ fn text_that_is_hidden_on_purpose_is_not_measured() {
 #[test]
 fn a_label_replaced_by_its_image_is_not_measured() {
     let site = Site::new("replaced");
-    // Ink on the dark image would be unreadable if it were shown.
+    // Ink on the dark image would be unreadable if it were shown. Every
+    // case uses a tag the color rule measures (`span` and `a` it never
+    // does), so the skip under test is the one that decides.
     let banner = ".banner { background: url(dark.png); color: #262421; }";
-    let shown = site.contrast(banner, "<h1 class=banner>Acme Tools</h1>");
-    assert!(sampled_on("dark.png", &shown), "{shown:?}");
     for (hide, body) in [
         // The classic replacements: the text is thrown out of its box.
         (
@@ -113,32 +113,51 @@ fn a_label_replaced_by_its_image_is_not_measured() {
             ".banner { text-indent: 100%; white-space: nowrap; overflow: hidden; }",
             "<h1 class=banner>Acme Tools</h1>",
         ),
-        // text-indent inherits: the label may sit in a child.
+        // text-indent inherits: the label may sit in a child block.
         (
             ".banner { text-indent: -999em; }",
-            "<h1 class=banner><span>Acme Tools</span></h1>",
+            "<div class=banner><p>Acme Tools</p></div>",
+        ),
+        // It moves the block's first line, so a reset on an inline box
+        // inside that block changes nothing.
+        (
+            ".banner { text-indent: -9999px; } .banner em { text-indent: 0; }",
+            "<h1 class=banner><em>Acme Tools</em></h1>",
+        ),
+        // white-space inherits too.
+        (
+            ".wrap { white-space: nowrap; } .banner { text-indent: 100%; overflow: hidden; }",
+            "<div class=wrap><h1 class=banner>Acme Tools</h1></div>",
         ),
         (".banner { font-size: 0; }", "<h1 class=banner>Acme Tools</h1>"),
-        // A visually-hidden label inside an image-backed box.
-        ("", "<div class=banner><span class=sr-only>Acme Tools</span></div>"),
+        // A visually-hidden heading inside an image-backed box.
+        ("", "<div class=banner><h2 class=sr-only>Acme Tools</h2></div>"),
         (
             ".label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }",
-            "<div class=banner><span class=label>Acme Tools</span></div>",
+            "<div class=banner><h2 class=label>Acme Tools</h2></div>",
         ),
     ] {
         let found = site.contrast(&format!("{banner} {hide}"), body);
         assert!(found.is_empty(), "{hide} {body}: {found:?}");
     }
     for (shown, body) in [
+        ("", "<h1 class=banner>Acme Tools</h1>"),
+        ("", "<h1 class=banner><em>Acme Tools</em></h1>"),
+        ("", "<div class=banner><h2>Acme Tools</h2></div>"),
         // An ordinary indent is still text on the image.
         (
             ".banner { text-indent: 2em; }",
             "<h1 class=banner>Acme Tools</h1>",
         ),
-        // text-indent inherits, so a child that resets it is visible again.
+        // text-indent inherits, so a child block that resets it is visible
+        // again, and so is an inline element made into a block.
         (
             ".banner { text-indent: -9999px; } .banner p { text-indent: 0; }",
             "<div class=banner><p>Acme Tools</p></div>",
+        ),
+        (
+            ".banner { text-indent: -9999px; } .banner em { display: block; text-indent: 0; }",
+            "<h1 class=banner><em>Acme Tools</em></h1>",
         ),
         // `100%` moves the first line only: where the text may wrap, or
         // nothing clips it, the rest is still there to read.

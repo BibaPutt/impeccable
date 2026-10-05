@@ -638,7 +638,7 @@ fn sampled_image_contrast(
         return None;
     }
     let ground = find_image_ground(el, images.levels())?;
-    if replaced_by_its_image(el, ground.node) {
+    if replaced_by_its_image(el) {
         return None;
     }
     let source = images.source(el.doc, ground.node, &ground.layer)?;
@@ -672,6 +672,19 @@ fn sampled_image_contrast(
     sampled_contrast::sampled_contrast(opts, &label, &samples, points.len())
 }
 
+/// Elements that are inline boxes unless `display` says otherwise.
+const INLINE_TAGS: &[&str] = &[
+    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "dfn", "em", "i", "kbd", "label",
+    "mark", "q", "s", "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var",
+];
+
+fn is_inline_box(el: &StaticElement<'_>) -> bool {
+    match sv(el.style(), "display") {
+        "" => INLINE_TAGS.contains(&el.tag_lower().as_str()),
+        display => display.eq_ignore_ascii_case("inline"),
+    }
+}
+
 /// Text hidden on purpose over the image that stands in for it: a
 /// visually-hidden label, `font-size: 0`, or a `text-indent` that throws the
 /// whole text out of its box. The image is the label, so there is no
@@ -679,34 +692,37 @@ fn sampled_image_contrast(
 /// measures one under 10px); a file scan has none and goes by the
 /// declarations that make them.
 ///
-/// `text-indent` inherits, so the nearest declaration from the text up to
-/// the image is the one that applies: a child that resets it is visible
-/// again. `-9999px` stretches the first line far enough to take all of the
+/// `text-indent` moves the first line of a block, so the block that holds
+/// the text is the one that counts, not an inline box inside it, and both it
+/// and `white-space` inherit: the nearest declaration at or above that block
+/// applies. `-9999px` stretches the first line far enough to take all of the
 /// text with it. `100%` only moves the first line, so it hides the text
-/// only where nothing wraps and the overflow is clipped.
-fn replaced_by_its_image(el: &StaticElement<'_>, image: ego_tree::NodeId) -> bool {
+/// only where nothing wraps and the block clips its overflow.
+fn replaced_by_its_image(el: &StaticElement<'_>) -> bool {
     let style = el.style();
     if is_visually_hidden(el, style) || parse_float(sv(style, "fontSize")) == 0.0 {
         return true;
     }
-    let mut current = Some(*el);
-    while let Some(cur) = current {
-        let style = cur.style();
-        let indent = js::trim(sv(style, "textIndent"));
-        if !indent.is_empty() {
-            let amount = parse_float(indent);
-            let pushed_out = indent.ends_with('%')
-                && amount >= 100.0
-                && sv(style, "whiteSpace") == "nowrap"
-                && matches!(sv(style, "overflow"), "hidden" | "clip");
-            return amount <= -999.0 || pushed_out;
-        }
-        if cur.id() == image {
+    let mut block = *el;
+    while is_inline_box(&block) {
+        let Some(parent) = block.parent_element() else {
             break;
-        }
-        current = cur.parent_element();
+        };
+        block = parent;
     }
-    false
+    let inherited = |prop: &str| {
+        std::iter::successors(Some(block), |e| e.parent_element())
+            .map(|e| js::trim(sv(e.style(), prop)))
+            .find(|value| !value.is_empty())
+            .unwrap_or("")
+    };
+    let indent = inherited("textIndent");
+    let amount = parse_float(indent);
+    amount <= -999.0
+        || (indent.ends_with('%')
+            && amount >= 100.0
+            && inherited("whiteSpace") == "nowrap"
+            && matches!(sv(block.style(), "overflow"), "hidden" | "clip"))
 }
 
 /// JS: checks.mjs#checkElementHoverContrast(el, style, tag, window)
