@@ -50,6 +50,12 @@ fn flip_file(qdir: &str, key: &str) -> String {
 fn next_file(qdir: &str, key: &str) -> String {
     jsp::join(&[qdir, &format!("{}.next.json", key)])
 }
+/// `<key>.render-check`: the id of the hand whose render-check line `--wait`
+/// already printed, so the line prints once per round, not once per poll. A
+/// new hand carries a new id, so the next round prints it again.
+fn render_check_file(qdir: &str, key: &str) -> String {
+    jsp::join(&[qdir, &format!("{}.render-check", key)])
+}
 
 /// `process.kill(pid, 0)`: Ok(()) alive, Err(true) EPERM (alive but unsignalable), Err(false) dead.
 fn pid_probe(pid: i64) -> Result<(), bool> {
@@ -99,17 +105,34 @@ fn is_comp_round_comp(path: &str) -> bool {
     dir == ".impeccable/mocks" || dir.ends_with("/.impeccable/mocks")
 }
 
-fn print_answer(io: &mut Io, raw: &str) {
+/// The comp round's option one: the decision comp `build-phase start
+/// --decision-comp` recorded, while that build's comps phase is open, served
+/// on a page that is the comp round (it also serves a comp directly in
+/// `.impeccable/mocks/`). A pick of it there is the approval, not a new
+/// option one; on any other page the same path is an ordinary decision slot.
+fn is_comp_rounds_option_one(cwd: &str, path: &str, served: &[String]) -> bool {
+    served.iter().any(|c| is_comp_round_comp(c)) && is_open_rounds_decision_comp(cwd, path)
+}
+
+fn is_open_rounds_decision_comp(cwd: &str, path: &str) -> bool {
+    let Some(state) = safe_read(&jsp::resolve(cwd, &[".impeccable/build/state.json"])).and_then(|raw| serde_json::from_str::<Value>(&raw).ok()) else { return false };
+    let Some(chosen) = state.get("decisionComp").and_then(Value::as_str) else { return false };
+    state.get("phase").and_then(Value::as_str) == Some("comps") && same_path(&jsp::resolve(cwd, &[chosen]), &jsp::resolve(cwd, &[path]))
+}
+
+fn print_answer(io: &mut Io, raw: &str, served: &[String]) {
     io.out(&format!("ANSWER: {}\n", raw));
     let Ok(a) = serde_json::from_str::<Value>(raw) else { return };
     let truthy = |k: &str| a.get(k).map(crate::staleness::js_truthy).unwrap_or(false);
     if truthy("hero") || truthy("board") {
         io.out("CHOSEN CARD: open the chosen world's board and hero images now, before any code. When your harness only reads files, or runs sandboxed, download them INTO the workspace and open the relative path; a sandboxed viewer rejects absolute paths outside it. They set the craft bar the build must reach.\n");
     }
-    if truthy("comp") && is_comp_round_comp(&a.get("comp").map(js_str).unwrap_or_default()) {
+    let comp = a.get("comp").map(js_str).unwrap_or_default();
+    let cwd = io.cwd.to_string_lossy().to_string();
+    if truthy("comp") && (is_comp_round_comp(&comp) || is_comp_rounds_option_one(&cwd, &comp, served)) {
         io.out("APPROVED COMP: the user picked this composition in the comp round, so it is the approved comp. Set \"approved\": true in its prompt sidecar, the image's full file name plus .json (a.png gets a.png.json), record its path in the surface brief, then close the comps phase with build-phase advance. Build from it as it stands; never regenerate it.\n");
     } else if truthy("comp") {
-        io.out("CHOSEN COMP: the decision comp at that path is compositional option one. On a comp-led build the comp round adds two variations beside it; on a code-led build it returns at the finish review as the critique reference. Never regenerate it from scratch.\n");
+        io.out("CHOSEN COMP: the decision comp at that path is compositional option one. On a comp-led build pass it to build-phase start as --decision-comp <that path>, and the comp round adds two variations beside it where it stands; on a code-led build it returns at the finish review as the critique reference. Never regenerate it from scratch.\n");
     }
     let option_id = a.get("optionId").and_then(|v| v.as_str());
     if option_id == Some("canon") {
@@ -397,14 +420,16 @@ fn round_comps(hand: Option<&Map<String, Value>>, state: Option<&Map<String, Val
 /// A declared comp is this hand's when its file exists and differs from the
 /// file that sat at the slot when the hand began (or none sat there). The comp
 /// round generates its comps directly in `.impeccable/mocks/` before it serves
-/// them, so those always count; with no hand recorded, existence decides.
+/// them, so those always count, as does its option one, the decision comp an
+/// open build recorded; with no hand recorded, existence decides.
 fn comp_is_this_hands(cwd: &str, comp: &str, hand: Option<&Map<String, Value>>) -> bool {
     let abs = jsp::resolve(cwd, &[comp]);
     if !exists(&abs) {
         return false;
     }
     let Some(hand) = hand else { return true };
-    if is_comp_round_comp(comp) {
+    let served = hand.get("comps").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+    if is_comp_round_comp(comp) || is_comp_rounds_option_one(cwd, comp, &served) {
         return true;
     }
     let generated = hand.get("generated").and_then(Value::as_array).map(|g| g.iter().any(|v| v.as_str() == Some(comp))).unwrap_or(false);
@@ -474,6 +499,34 @@ fn sidecar_missing_line(env: &Env, cwd: &str, missing: &[String]) -> String {
         missing.join(", "),
         visualize_ref(env, cwd)
     )
+}
+
+/// This hand's landed decision comps that carry their prompt sidecar: the
+/// renders the agent owes visualize.md's post-render checks. Comp-round comps
+/// sit outside this: the decision round is where the checks go unrun.
+fn landed_decision_comps(cwd: &str, comps: &[String], hand: Option<&Map<String, Value>>) -> bool {
+    comps.iter().any(|c| !is_comp_round_comp(c) && !is_comp_rounds_option_one(cwd, c, comps) && comp_is_this_hands(cwd, c, hand) && exists(&format!("{}.json", jsp::resolve(cwd, &[c.as_str()]))))
+}
+
+/// The `--wait` render-check directive: once per hand, the first poll that
+/// finds a landed decision comp with its sidecar while the user is deciding.
+fn render_check_line(env: &Env, cwd: &str) -> String {
+    format!(
+        "NEXT open each decision comp once and run {}'s render checks (shipped screen, one dominant move); regenerate any that fail before the user answers.\n",
+        visualize_ref(env, cwd)
+    )
+}
+
+/// Whether this poll owes the render-check line, recording that it was owed
+/// so the next poll of the same hand stays quiet.
+fn render_check_due(qdir: &str, key: &str, hand: Option<&Map<String, Value>>) -> bool {
+    let id = hand.map(hand_marker_id).unwrap_or_default();
+    let marker = render_check_file(qdir, key);
+    if safe_read(&marker).as_deref() == Some(id.as_str()) {
+        return false;
+    }
+    let _ = std::fs::write(&marker, &id);
+    true
 }
 
 /// The comps recorded for the live round in `<key>.state.json`.
@@ -610,10 +663,10 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             return 4;
         }
         // Read before the answer path may delete the state file.
-        let (missing, stale) = {
-            let hand = read_hand(&qdir, &key);
+        let hand = read_hand(&qdir, &key);
+        let (missing, stale, landed, served) = {
             let comps = round_comps(hand.as_ref(), read_state(&qdir, &key).as_ref());
-            (comps_missing_sidecar(&cwd, &comps, hand.as_ref()), stale_comps(&cwd, &comps, hand.as_ref()))
+            (comps_missing_sidecar(&cwd, &comps, hand.as_ref()), stale_comps(&cwd, &comps, hand.as_ref()), landed_decision_comps(&cwd, &comps, hand.as_ref()), comps)
         };
         if !answered() {
             io.out(&format!("WAITING: no answer yet after {}s; run --wait --key {} again\n", crate::util::js_number_to_string(poll_sec), key));
@@ -625,11 +678,14 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             if !stale.is_empty() {
                 io.out(&stale_comps_line(&env, &cwd, &stale));
             }
+            if landed && render_check_due(&qdir, &key, hand.as_ref()) {
+                io.out(&render_check_line(&env, &cwd));
+            }
             return 3;
         }
         let collected = safe_read(&answer_file(&qdir, &key)).unwrap_or_default();
         let collected = crate::util::js_trim(&collected).to_string();
-        print_answer(io, &collected);
+        print_answer(io, &collected, &served);
         if !missing.is_empty() {
             io.out(&sidecar_missing_line(&env, &cwd, &missing));
         }
@@ -641,6 +697,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         if !keeps_open {
             let _ = std::fs::remove_file(state_file(&qdir, &key));
             let _ = std::fs::remove_file(hand_file(&qdir, &key));
+            let _ = std::fs::remove_file(render_check_file(&qdir, &key));
             let _ = std::fs::remove_dir_all(generated_dir(&qdir, &key));
         }
         return 0;
@@ -659,7 +716,8 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         let _ = std::fs::remove_file(answer_file(&qdir, &key));
         let _ = std::fs::remove_file(state_file(&qdir, &key));
         let _ = std::fs::remove_file(hand_file(&qdir, &key));
-            let _ = std::fs::remove_dir_all(generated_dir(&qdir, &key));
+        let _ = std::fs::remove_file(render_check_file(&qdir, &key));
+        let _ = std::fs::remove_dir_all(generated_dir(&qdir, &key));
         io.out("stopped\n");
         return 0;
     }
@@ -1059,7 +1117,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                 let _ = std::fs::create_dir_all(&st.qdir);
                 let _ = std::fs::write(answer_file(&st.qdir, &k), format!("{}\n", answer));
             } else {
-                print_answer(io, &answer);
+                print_answer(io, &answer, &declared_comps(&st.payload));
                 let _ = io.stdout.flush();
             }
             if !((is_reroll || followup_open) && st.detached_key.is_some()) {
@@ -2095,7 +2153,7 @@ mod tests {
 
     fn answer_lines(raw: &str) -> String {
         let (mut io, cap) = Io::captured("", std::env::temp_dir(), Env::new());
-        print_answer(&mut io, raw);
+        print_answer(&mut io, raw, &[]);
         let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
         out
     }
@@ -2109,7 +2167,52 @@ mod tests {
 
         let out = answer_lines(r#"{"optionId":"a","steer":"","comp":".impeccable/mocks/decision/a.png"}"#);
         assert!(out.contains("CHOSEN COMP: the decision comp at that path is compositional option one."), "{out}");
+        assert!(out.contains("--decision-comp <that path>"), "{out}");
         assert!(!out.contains("APPROVED COMP"), "{out}");
+    }
+
+    #[test]
+    fn comp_round_pick_of_the_recorded_decision_comp_is_the_approval() {
+        let dir = std::env::temp_dir().join(format!("impeccable-sq-decision-{}-{}", std::process::id(), now_ms() as u64));
+        std::fs::create_dir_all(dir.join(".impeccable/build")).unwrap();
+        let slot = ".impeccable/mocks/decision/a.png";
+        let round: Vec<String> = vec![slot.into(), ".impeccable/mocks/comp-2.png".into(), ".impeccable/mocks/comp-3.png".into()];
+        let decision_page: Vec<String> = vec![slot.into(), ".impeccable/mocks/decision/b.png".into()];
+        let answer = |raw: &str, served: &[String]| {
+            let (mut io, cap) = Io::captured("", dir.clone(), Env::new());
+            print_answer(&mut io, raw, served);
+            let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap();
+            out
+        };
+        let state = |phase: &str| json!({ "phase": phase, "decisionComp": slot }).to_string();
+        std::fs::write(dir.join(".impeccable/build/state.json"), state("comps")).unwrap();
+        let out = answer(r#"{"optionId":"one","comp":"./.impeccable/mocks/decision/a.png"}"#, &round);
+        assert!(out.contains("APPROVED COMP") && !out.contains("CHOSEN COMP"), "{out}");
+        // Served again in the comp round, option one is this hand's comp, never stale.
+        std::fs::create_dir_all(dir.join(".impeccable/mocks/decision")).unwrap();
+        std::fs::write(dir.join(slot), b"png").unwrap();
+        let cwd = dir.to_string_lossy().to_string();
+        let options: Vec<Value> = round.iter().map(|c| json!({ "id": c, "comp": c })).collect();
+        let hand = new_hand(&cwd, &json!({ "options": options }));
+        assert!(comp_is_this_hands(&cwd, slot, Some(&hand)));
+        assert!(stale_comps(&cwd, &[slot.to_string()], Some(&hand)).is_empty());
+        // Option one is not a decision-round comp: no render-check directive for it.
+        std::fs::write(dir.join(format!("{slot}.json")), b"{}").unwrap();
+        assert!(!landed_decision_comps(&cwd, &round, Some(&hand)));
+        // A new direction round reusing that slot is not the comp round: the old image is stale there.
+        let options: Vec<Value> = decision_page.iter().map(|c| json!({ "id": c, "comp": c })).collect();
+        let hand = new_hand(&cwd, &json!({ "options": options }));
+        assert!(!comp_is_this_hands(&cwd, slot, Some(&hand)));
+        assert_eq!(stale_comps(&cwd, &[slot.to_string()], Some(&hand)), vec![slot.to_string()]);
+        let out = answer(r#"{"optionId":"one","comp":".impeccable/mocks/decision/a.png"}"#, &decision_page);
+        assert!(out.contains("CHOSEN COMP") && !out.contains("APPROVED COMP"), "{out}");
+        // Another decision comp, or the same one once the round closed, stays a decision pick.
+        let out = answer(r#"{"optionId":"b","comp":".impeccable/mocks/decision/b.png"}"#, &round);
+        assert!(out.contains("CHOSEN COMP") && !out.contains("APPROVED COMP"), "{out}");
+        std::fs::write(dir.join(".impeccable/build/state.json"), state("spec")).unwrap();
+        let out = answer(r#"{"optionId":"one","comp":".impeccable/mocks/decision/a.png"}"#, &round);
+        assert!(out.contains("CHOSEN COMP") && !out.contains("APPROVED COMP"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2168,6 +2271,91 @@ mod tests {
         std::fs::write(dir.join(".impeccable/questions/k1.answer.json"), r#"{"optionId":"a"}"#).unwrap();
         let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
         assert!(!out.contains("COMP STALE") && !out.contains("COMP SIDECAR MISSING"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_prints_the_render_check_once_per_hand() {
+        const LINE: &str = "NEXT open each decision comp once and run ";
+        let dir = temp_project("wait-render-check");
+        let cwd = dir.to_string_lossy().into_owned();
+        let qdir = jsp::join(&[&cwd, ".impeccable", "questions"]);
+        let comps = [".impeccable/mocks/decision/a.png", ".impeccable/mocks/decision/b.png"];
+        let payload = json!({ "options": comps.iter().map(|c| json!({ "comp": c })).collect::<Vec<_>>() });
+        let state = json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/", "comps": comps });
+        std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
+        write_hand(&qdir, "k1", &new_hand(&cwd, &payload)).unwrap();
+        let wait = || {
+            let (code, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
+            assert_eq!(code, 3);
+            out.replace('\\', "/")
+        };
+
+        // Nothing landed yet: no line.
+        assert!(!wait().contains(LINE));
+        // A comp landed without its sidecar is not ready to be checked.
+        std::fs::write(dir.join(comps[0]), b"png").unwrap();
+        assert!(!wait().contains(LINE));
+
+        // The first wait after a comp lands with its sidecar prints it once.
+        std::fs::write(dir.join(format!("{}.json", comps[0])), r#"{"prompt":"p"}"#).unwrap();
+        let out = wait();
+        // Windows resolves the skill dir with a drive letter, so match from the path on.
+        assert!(out.contains("/skill/reference/visualize.md's render checks (shipped screen, one dominant move); regenerate any that fail before the user answers.\n"), "{out}");
+        assert_eq!(out.matches(LINE).count(), 1, "{out}");
+        // Later polls of the same hand stay quiet, even as more comps land.
+        assert!(!wait().contains(LINE));
+        std::fs::write(dir.join(comps[1]), b"png").unwrap();
+        std::fs::write(dir.join(format!("{}.json", comps[1])), r#"{"prompt":"p"}"#).unwrap();
+        assert!(!wait().contains(LINE));
+
+        // A new hand (an --update round) prints it again once its comps land.
+        std::fs::remove_file(dir.join(comps[0])).unwrap();
+        std::fs::remove_file(dir.join(comps[1])).unwrap();
+        write_hand(&qdir, "k1", &new_hand(&cwd, &payload)).unwrap();
+        assert!(!wait().contains(LINE));
+        std::fs::write(dir.join(comps[0]), b"png2").unwrap();
+        assert!(wait().contains(LINE));
+        assert!(!wait().contains(LINE));
+
+        // Never after the pick: the answer is the user's, not a poll.
+        write_hand(&qdir, "k1", &new_hand(&cwd, &payload)).unwrap();
+        std::fs::write(dir.join(comps[0]), b"png3").unwrap();
+        std::fs::write(dir.join(".impeccable/questions/k1.answer.json"), r#"{"optionId":"a"}"#).unwrap();
+        let (code, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "2"]);
+        assert_eq!(code, 0);
+        assert!(!out.contains(LINE), "{out}");
+        assert!(!dir.join(".impeccable/questions/k1.render-check").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_skips_the_render_check_for_code_led_and_comp_round_comps() {
+        const LINE: &str = "NEXT open each decision comp once and run ";
+        let dir = temp_project("wait-render-check-skip");
+        let cwd = dir.to_string_lossy().into_owned();
+        let qdir = jsp::join(&[&cwd, ".impeccable", "questions"]);
+        // Code-led: the slots are a flip reserve. A file there predates the
+        // hand (an earlier round's), so it is not this hand's comp.
+        let slot = ".impeccable/mocks/decision/a.png";
+        std::fs::write(dir.join(slot), b"old").unwrap();
+        std::fs::write(dir.join(format!("{}.json", slot)), r#"{"prompt":"p"}"#).unwrap();
+        let payload = json!({ "options": [{ "comp": slot }], "buildPath": { "value": "code", "toggle": true } });
+        let state = json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/", "comps": [slot] });
+        std::fs::write(dir.join(".impeccable/questions/k1.state.json"), state.to_string()).unwrap();
+        write_hand(&qdir, "k1", &new_hand(&cwd, &payload)).unwrap();
+        let (_, out) = run_captured(&dir, &["--wait", "--key", "k1", "--poll", "0"]);
+        assert!(!out.contains(LINE), "{out}");
+
+        // The comp round's own comps are not decision comps.
+        let comp = ".impeccable/mocks/comp-b.png";
+        std::fs::write(dir.join(comp), b"png").unwrap();
+        std::fs::write(dir.join(format!("{}.json", comp)), r#"{"prompt":"p"}"#).unwrap();
+        let state = json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/", "comps": [comp] });
+        std::fs::write(dir.join(".impeccable/questions/k2.state.json"), state.to_string()).unwrap();
+        write_hand(&qdir, "k2", &new_hand(&cwd, &json!({ "options": [{ "comp": comp }] }))).unwrap();
+        let (_, out) = run_captured(&dir, &["--wait", "--key", "k2", "--poll", "0"]);
+        assert!(!out.contains(LINE), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
