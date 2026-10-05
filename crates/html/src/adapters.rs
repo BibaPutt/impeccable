@@ -13,7 +13,7 @@ use crate::background::{
 use crate::cascade::StyleValues;
 use crate::dom::{StaticDocument, StaticElement};
 use crate::image_sampling::{ground_label, layer_url, ImageSampler};
-use crate::quality::{collapse_ws, pf0, resolve_font_size_px};
+use crate::quality::{collapse_ws, is_visually_hidden, pf0, resolve_font_size_px};
 use impeccable_core::checks::measures::{
     self, border_colors_from_style, border_widths_from_style, check_gpt_thin_border_wide_shadow,
     check_oversized_h1, check_radial_spotlight, positioned_style_implies_escape, resolve_length_px,
@@ -638,6 +638,9 @@ fn sampled_image_contrast(
         return None;
     }
     let ground = find_image_ground(el, images.levels())?;
+    if replaced_by_its_image(el, ground.node) {
+        return None;
+    }
     let source = images.source(el.doc, ground.node, &ground.layer)?;
     let extents = sampled_contrast::layer_extents(
         &ground.layer.repeat,
@@ -667,6 +670,36 @@ fn sampled_image_contrast(
         .collect();
     let label = ground_label(&layer_url(el.doc, ground.node, &ground.layer));
     sampled_contrast::sampled_contrast(opts, &label, &samples, points.len())
+}
+
+/// Text hidden on purpose over the image that stands in for it: a
+/// visually-hidden label, `font-size: 0`, or a `text-indent` that throws the
+/// text out of its box (`-9999px`, or `100%` under `overflow: hidden`)
+/// declared anywhere from the text up to the image. The image is the label,
+/// so there is no contrast to measure; the browser path skips these by their
+/// boxes, which a file scan does not have.
+fn replaced_by_its_image(el: &StaticElement<'_>, image: ego_tree::NodeId) -> bool {
+    let style = el.style();
+    if is_visually_hidden(el, style) || parse_float(sv(style, "fontSize")) == 0.0 {
+        return true;
+    }
+    let mut current = Some(*el);
+    while let Some(cur) = current {
+        let style = cur.style();
+        let indent = js::trim(sv(style, "textIndent"));
+        let thrown_left = parse_float(indent) <= -999.0;
+        let pushed_out = indent.ends_with('%')
+            && parse_float(indent) >= 100.0
+            && matches!(sv(style, "overflow"), "hidden" | "clip");
+        if thrown_left || pushed_out {
+            return true;
+        }
+        if cur.id() == image {
+            break;
+        }
+        current = cur.parent_element();
+    }
+    false
 }
 
 /// JS: checks.mjs#checkElementHoverContrast(el, style, tag, window)

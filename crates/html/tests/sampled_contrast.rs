@@ -97,6 +97,47 @@ fn text_that_is_hidden_on_purpose_is_not_measured() {
 }
 
 #[test]
+fn a_label_replaced_by_its_image_is_not_measured() {
+    let site = Site::new("replaced");
+    // Ink on the dark image would be unreadable if it were shown.
+    let banner = ".banner { background: url(dark.png); color: #262421; }";
+    let shown = site.contrast(banner, "<h1 class=banner>Acme Tools</h1>");
+    assert!(sampled_on("dark.png", &shown), "{shown:?}");
+    for (hide, body) in [
+        // The classic replacements: the text is thrown out of its box.
+        (
+            ".banner { text-indent: -9999px; overflow: hidden; }",
+            "<h1 class=banner>Acme Tools</h1>",
+        ),
+        (
+            ".banner { text-indent: 100%; white-space: nowrap; overflow: hidden; }",
+            "<h1 class=banner>Acme Tools</h1>",
+        ),
+        // text-indent inherits: the label may sit in a child.
+        (
+            ".banner { text-indent: -999em; }",
+            "<h1 class=banner><span>Acme Tools</span></h1>",
+        ),
+        (".banner { font-size: 0; }", "<h1 class=banner>Acme Tools</h1>"),
+        // A visually-hidden label inside an image-backed box.
+        ("", "<div class=banner><span class=sr-only>Acme Tools</span></div>"),
+        (
+            ".label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }",
+            "<div class=banner><span class=label>Acme Tools</span></div>",
+        ),
+    ] {
+        let found = site.contrast(&format!("{banner} {hide}"), body);
+        assert!(found.is_empty(), "{hide} {body}: {found:?}");
+    }
+    // An ordinary indent is still text on the image.
+    let indented = site.contrast(
+        &format!("{banner} .banner {{ text-indent: 2em; }}"),
+        "<h1 class=banner>Acme Tools</h1>",
+    );
+    assert!(sampled_on("dark.png", &indented), "{indented:?}");
+}
+
+#[test]
 fn a_scrim_with_a_keyword_stop_keeps_the_skip() {
     let site = Site::new("scrim");
     let body = "<div class=hero><p>Copy over a scrim</p></div>";

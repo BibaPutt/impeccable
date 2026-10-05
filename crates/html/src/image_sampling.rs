@@ -81,11 +81,14 @@ thread_local! {
     static RASTERS: RefCell<HashMap<String, Option<Rc<Raster>>>> = RefCell::new(HashMap::new());
 }
 
-fn cached_raster(key: &str, make: impl FnOnce() -> Option<Raster>) -> Option<Rc<Raster>> {
+/// The raster for `key`, decoded from `read()` on a miss. What the decode
+/// says about those bytes is kept, a failure included; a read that fails
+/// says nothing about them and is asked again.
+fn cached_raster(key: &str, read: impl FnOnce() -> Option<Vec<u8>>) -> Option<Rc<Raster>> {
     if let Some(hit) = RASTERS.with(|c| c.borrow().get(key).cloned()) {
         return hit;
     }
-    let value = make().map(Rc::new);
+    let value = decode(&read()?).map(Rc::new);
     RASTERS.with(|c| {
         let mut cache = c.borrow_mut();
         if cache.len() >= CACHE_ENTRIES {
@@ -150,7 +153,7 @@ impl ImageSampler {
         source: &ImageSource,
     ) -> Option<Rc<Raster>> {
         cached_raster(&source.key, || {
-            decode(&source_bytes(source, &layer_url(doc, node, layer))?)
+            source_bytes(source, &layer_url(doc, node, layer))
         })
     }
 
@@ -373,7 +376,7 @@ mod tests {
 
     fn raster(sampler: &ImageSampler, url: &str) -> Option<Rc<Raster>> {
         let source = sampler.find_source(url)?;
-        cached_raster(&source.key, || decode(&source_bytes(&source, url)?))
+        cached_raster(&source.key, || source_bytes(&source, url))
     }
 
     #[test]

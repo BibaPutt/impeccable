@@ -257,6 +257,11 @@ pub fn apply_static_declaration<K: Hash + Eq>(
     let mut expanded = expand_static_declaration(prop, value);
     expanded.extend(internal_border_style_expansion(prop, value));
     expanded.extend(background_longhands(prop, value));
+    // Not in the JS model either: `text-indent` is how image-replacement
+    // text leaves its box, which the sampled-contrast path has to know.
+    if prop.eq_ignore_ascii_case("text-indent") {
+        expanded.push(("textIndent".into(), js::trim(value).to_string()));
+    }
     for (expanded_prop, expanded_value) in expanded {
         let existing = map.get(&expanded_prop).map(|d| &d.meta);
         if compare_static_priority(existing, meta) {
