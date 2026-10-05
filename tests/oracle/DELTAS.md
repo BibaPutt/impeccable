@@ -389,4 +389,4 @@ The skill says the direction round's chosen decision comp enters the comp round 
 New cases, recorded from the binary and reviewed by hand:
 
 - `build-phase-decision-comp-option-one`: `--decision-comp` with `--comp` and with a missing file exit 1; `start --direction seed --decision-comp` prints the option-one NEXT; the first `advance` fails with `1 comp (the chosen decision comp ... as option one, the others directly under .impeccable/mocks)` and no approval, although an unrelated decision comp carries `"approved": true`; after two comps land in `.impeccable/mocks/` and the decision comp's sidecar is approved, `advance` closes on it (`3 comps, 1 approved`), and the snapshotted state and `approved-comp.json` name the decision path.
-- `question-wait-answer-decision-comp-in-round`: with a build state in the `comps` phase recording `decisionComp`, a pick of that path prints `APPROVED COMP`, not `CHOSEN COMP`.
+- `question-wait-answer-decision-comp-in-round`: with a build state in the `comps` phase recording `decisionComp` and a page that also serves a comp directly in `.impeccable/mocks/`, a pick of that path prints `APPROVED COMP`, not `CHOSEN COMP`.
