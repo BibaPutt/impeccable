@@ -158,6 +158,23 @@ impl RenderedTextCount {
             self.count += 1;
         }
     }
+
+    /// An atomic inline (an image, an inline-block) sits in the line like a
+    /// character, so a collapsible space on each side of it renders: the run
+    /// ends at the box, which adds no character of its own.
+    fn end_collapsible_run(&mut self) {
+        self.in_collapsible_run = false;
+    }
+}
+
+/// Replaced elements, which lay out as atomic inlines in a line of text.
+const REPLACED_TAGS: [&str; 11] =
+    ["img", "svg", "video", "canvas", "iframe", "object", "embed", "input", "select", "textarea", "button"];
+
+/// An atomic inline box: a replaced element or an `inline-*` display.
+fn is_atomic_inline(dom: &dyn Dom, el: ElId) -> bool {
+    REPLACED_TAGS.contains(&tag_lower(dom, el).as_str())
+        || js::to_lower_case(&dom.style(el, "display")).trim().starts_with("inline-")
 }
 
 /// Feeds the text nodes under `el` in document order, each under its own
@@ -181,7 +198,14 @@ fn feed_rendered_text(dom: &dyn Dom, el: ElId, out: &mut RenderedTextCount) {
                 if renders_no_text(dom, child) {
                     continue;
                 }
+                let atomic = is_atomic_inline(dom, child);
+                if atomic {
+                    out.end_collapsible_run();
+                }
                 feed_rendered_text(dom, child, out);
+                if atomic {
+                    out.end_collapsible_run();
+                }
             }
         }
     }
@@ -1630,6 +1654,22 @@ mod rendered_text_tests {
             d.add_text(inline, "shown ");
             d.add_text(r, "after");
             assert_eq!(rendered_text_len(&d, r), "Before shown after".len(), "{display}");
+        }
+    }
+
+    /// An image or an empty inline-block is an atomic inline: the space on
+    /// each side of it renders, so the pair does not fold into one.
+    #[test]
+    fn spaces_around_an_atomic_inline_both_count() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        for (tag, display) in [("img", "inline"), ("span", "inline-block")] {
+            let r = two_line_p(&mut d, body);
+            d.add_text(r, "word ");
+            let boxed = d.add(Some(r), tag);
+            d.set_style(boxed, "display", display);
+            d.add_text(r, " word");
+            assert_eq!(rendered_text_len(&d, r), "word  word".len(), "{tag}");
         }
     }
 }
