@@ -265,9 +265,10 @@ fn comp_entry(io: &Io, file: String) -> CompEntry {
 }
 
 /// The chosen decision comp `build-phase start --decision-comp` recorded for
-/// this comp round, while it is still on disk: compositional option one.
-fn decision_comp(io: &Io, state: &Value) -> Option<String> {
-    state.get("decisionComp").and_then(Value::as_str).filter(|c| abs(io, c).is_file()).map(String::from)
+/// this comp round: compositional option one. It stays recorded when its file
+/// goes missing, so the gate refuses rather than forgetting it.
+fn decision_comp(state: &Value) -> Option<String> {
+    state.get("decisionComp").and_then(Value::as_str).map(String::from)
 }
 
 /// The comp round's options: the recorded decision comp first, wherever it
@@ -275,8 +276,8 @@ fn decision_comp(io: &Io, state: &Value) -> Option<String> {
 /// comp under `.impeccable/mocks/decision/` never counts.
 fn list_comps(io: &Io, state: &Value) -> Vec<CompEntry> {
     let dir = abs(io, MOCKS_DIR);
-    let chosen = decision_comp(io, state);
-    let mut out: Vec<CompEntry> = chosen.iter().map(|c| comp_entry(io, c.clone())).collect();
+    let chosen = decision_comp(state);
+    let mut out: Vec<CompEntry> = chosen.iter().filter(|c| abs(io, c).is_file()).map(|c| comp_entry(io, c.clone())).collect();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return out;
     };
@@ -304,8 +305,12 @@ fn basename(p: &str) -> String {
 fn gate_comps(io: &Io, state: &Value) -> Gate {
     let comps = list_comps(io, state);
     let mut reasons = Vec::new();
+    let chosen = decision_comp(state);
+    if let Some(c) = chosen.as_ref().filter(|c| !abs(io, c).is_file()) {
+        reasons.push(format!("the chosen decision comp {c} is missing: it is option one of this comp round and is never regenerated or replaced. Restore the file the user chose at that path (with its prompt sidecar), then advance again."));
+    }
     if comps.len() < 3 {
-        let place = match decision_comp(io, state) {
+        let place = match chosen {
             Some(c) => format!(" (the chosen decision comp {c} as option one, the others directly under {MOCKS_DIR})"),
             None => format!(" under {MOCKS_DIR}"),
         };
@@ -2913,7 +2918,7 @@ fn next_instruction(io: &Io, state: &Value) -> String {
     match phase {
         "comps" => {
             let dir = direction.map(|d| format!(" (seed {d})")).unwrap_or_default();
-            if let Some(chosen) = decision_comp(io, state) {
+            if let Some(chosen) = decision_comp(state) {
                 return format!("Comp round for the chosen direction{dir}: read reference/visualize.md. The chosen decision comp {chosen} is compositional option one; it stays where it is and is never regenerated. Generate two more compositional comps of the requested surface at its viewport into {MOCKS_DIR}/ (each with a prompt sidecar), put all three in front of the user, and set \"approved\": true in the chosen comp's sidecar ({chosen}.json when they keep option one). Then {s} build-phase advance. No page code before this closes.");
             }
             format!("Comp round for the chosen direction{dir}: read reference/visualize.md, generate three compositional comps of the requested surface at its own viewport into {MOCKS_DIR}/ (each with a prompt sidecar), put them in front of the user, and set \"approved\": true in the chosen comp's sidecar. Then {s} build-phase advance. No page code before this closes.")
@@ -3351,6 +3356,11 @@ pub fn run_with_renderer(argv: &[String],io: &mut Io,organic_scan: OrganicScan,r
     if cmd == "start" {
         let comp = arg(argv, "comp");
         let direction = arg(argv, "direction");
+        let chosen_decision = arg(argv, "decision-comp");
+        if chosen_decision.is_some() && (comp.is_some() || direction.is_none()) {
+            io.err("build-phase: --decision-comp names option one of a comp round, so it goes with --direction and never with --comp\n");
+            return 1;
+        }
         if comp.is_none() && direction.is_none() {
             io.err("build-phase: start needs --comp <approved comp png> (comp already approved) or --direction <seed key> (comp round still to run)\n");
             return 1;
@@ -3361,12 +3371,7 @@ pub fn run_with_renderer(argv: &[String],io: &mut Io,organic_scan: OrganicScan,r
                 return 1;
             }
         }
-        let chosen_decision = arg(argv, "decision-comp");
         if let Some(d) = chosen_decision {
-            if comp.is_some() || direction.is_none() {
-                io.err("build-phase: --decision-comp names option one of a comp round, so it goes with --direction and never with --comp\n");
-                return 1;
-            }
             if !abs(io, d).is_file() {
                 io.err(&format!("build-phase: decision comp {d} does not exist\n"));
                 return 1;

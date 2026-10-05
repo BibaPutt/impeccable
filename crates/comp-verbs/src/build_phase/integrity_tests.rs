@@ -1844,6 +1844,9 @@ fn chosen_decision_comp_is_option_one_and_becomes_the_approved_reference() {
     let (mut io, c) = captured(&ws);
     assert_eq!(run(&["start", "--reset", "--comp", CHOSEN, "--decision-comp", CHOSEN].map(String::from), &mut io, &no_organic_scan), 1);
     assert!(out_err(&c).contains("goes with --direction and never with --comp"), "{}", out_err(&c));
+    let (mut io, c) = captured(&ws);
+    assert_eq!(run(&["start", "--reset", "--decision-comp", CHOSEN].map(String::from), &mut io, &no_organic_scan), 1);
+    assert!(out_err(&c).contains("goes with --direction and never with --comp"), "{}", out_err(&c));
     assert_eq!(run(&["start", "--reset", "--direction", "seed", "--decision-comp", ".impeccable/mocks/decision/none.png"].map(String::from), &mut io, &no_organic_scan), 1);
 
     let mut io = ws.io();
@@ -1864,6 +1867,16 @@ fn chosen_decision_comp_is_option_one_and_becomes_the_approved_reference() {
     // An approval on the unrelated decision comp is not an approval of the round.
     ws.write(&format!("{OTHER}.json"), br#"{"prompt":"decision comp","approved":true}"#);
     assert!(!gate_comps(&io, &state).ok);
+    // A deleted option one is not forgotten: three root comps cannot close the round without it.
+    let kept = std::fs::read(ws.path.join(CHOSEN)).unwrap();
+    std::fs::remove_file(ws.path.join(CHOSEN)).unwrap();
+    ws.write(".impeccable/mocks/comp-4.png", &png_io::encode_png(&r::create_image(40, 20, [5, 5, 5, 255]), &[]).unwrap());
+    ws.write(".impeccable/mocks/comp-4.png.json", br#"{"prompt":"replacement","approved":true}"#);
+    let gate = gate_comps(&io, &state);
+    assert!(!gate.ok && gate.reasons[0].starts_with(&format!("the chosen decision comp {CHOSEN} is missing")), "{:?}", gate.reasons);
+    std::fs::remove_file(ws.path.join(".impeccable/mocks/comp-4.png")).unwrap();
+    std::fs::remove_file(ws.path.join(".impeccable/mocks/comp-4.png.json")).unwrap();
+    ws.write(CHOSEN, &kept);
     // The user keeps option one: the comps gate closes on it where it stands.
     ws.write(&format!("{CHOSEN}.json"), br#"{"prompt":"decision comp","approved":true}"#);
     assert_eq!(run(&["advance"].map(String::from), &mut io, &no_organic_scan), 0);

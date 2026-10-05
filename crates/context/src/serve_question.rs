@@ -414,14 +414,15 @@ fn round_comps(hand: Option<&Map<String, Value>>, state: Option<&Map<String, Val
 /// A declared comp is this hand's when its file exists and differs from the
 /// file that sat at the slot when the hand began (or none sat there). The comp
 /// round generates its comps directly in `.impeccable/mocks/` before it serves
-/// them, so those always count; with no hand recorded, existence decides.
+/// them, so those always count, as does its option one, the decision comp an
+/// open build recorded; with no hand recorded, existence decides.
 fn comp_is_this_hands(cwd: &str, comp: &str, hand: Option<&Map<String, Value>>) -> bool {
     let abs = jsp::resolve(cwd, &[comp]);
     if !exists(&abs) {
         return false;
     }
     let Some(hand) = hand else { return true };
-    if is_comp_round_comp(comp) {
+    if is_comp_round_comp(comp) || is_open_rounds_decision_comp(cwd, comp) {
         return true;
     }
     let generated = hand.get("generated").and_then(Value::as_array).map(|g| g.iter().any(|v| v.as_str() == Some(comp))).unwrap_or(false);
@@ -2177,6 +2178,15 @@ mod tests {
         std::fs::write(dir.join(".impeccable/build/state.json"), state("comps")).unwrap();
         let out = answer(r#"{"optionId":"one","comp":"./.impeccable/mocks/decision/a.png"}"#);
         assert!(out.contains("APPROVED COMP") && !out.contains("CHOSEN COMP"), "{out}");
+        // Served again in the comp round, option one is this hand's comp, never stale.
+        let slot = ".impeccable/mocks/decision/a.png";
+        std::fs::create_dir_all(dir.join(".impeccable/mocks/decision")).unwrap();
+        std::fs::write(dir.join(slot), b"png").unwrap();
+        let cwd = dir.to_string_lossy().to_string();
+        let hand = new_hand(&cwd, &json!({ "options": [{ "id": "one", "comp": slot }] }));
+        assert!(comp_is_this_hands(&cwd, slot, Some(&hand)));
+        assert!(stale_comps(&cwd, &[slot.to_string()], Some(&hand)).is_empty());
+        assert!(!any_comp_pending(&cwd, &[slot.to_string()], Some(&hand)));
         // Another decision comp, or the same one once the round closed, stays a decision pick.
         let out = answer(r#"{"optionId":"b","comp":".impeccable/mocks/decision/b.png"}"#);
         assert!(out.contains("CHOSEN COMP") && !out.contains("APPROVED COMP"), "{out}");
