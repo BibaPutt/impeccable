@@ -676,8 +676,9 @@ fn sampled_image_contrast(
 /// visually-hidden label, `font-size: 0`, or a `text-indent` that throws the
 /// text out of its box (`-9999px`, or `100%` under `overflow: hidden`)
 /// declared anywhere from the text up to the image. The image is the label,
-/// so there is no contrast to measure; the browser path skips these by their
-/// boxes, which a file scan does not have.
+/// so there is no contrast to measure. A browser can tell by the boxes (the
+/// DOM path never measures one under 10px); a file scan has none and goes by
+/// the declarations that make them.
 fn replaced_by_its_image(el: &StaticElement<'_>, image: ego_tree::NodeId) -> bool {
     let style = el.style();
     if is_visually_hidden(el, style) || parse_float(sv(style, "fontSize")) == 0.0 {
