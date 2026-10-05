@@ -126,6 +126,10 @@ struct RenderedTextCount {
     pending: usize,
     /// The last white space seen was collapsible, so more of it joins that run.
     in_collapsible_run: bool,
+    /// Count white space that cannot collapse (preserved, or a no-break
+    /// space) where it stands, edges included. Set for an atomic inline's
+    /// contents, whose edges trim only collapsible white space.
+    keep_fixed_spaces: bool,
 }
 
 impl RenderedTextCount {
@@ -140,7 +144,7 @@ impl RenderedTextCount {
                 }
                 continue;
             }
-            if js::is_js_whitespace(c) {
+            if js::is_js_whitespace(c) && !self.keep_fixed_spaces {
                 self.pending += 1;
                 self.in_collapsible_run = false;
                 continue;
@@ -163,8 +167,9 @@ impl RenderedTextCount {
     /// contents counted `inner` characters. The box sits in the line like a
     /// character, so a collapsible space on each side of it renders: the run
     /// ends at the box. Its contents were counted in a count of their own,
-    /// because they are laid out in their own formatting context and their
-    /// edge white space is trimmed there, never joined to the outer run.
+    /// because they are laid out in their own formatting context: their edge
+    /// collapsible white space is trimmed there and never joins the outer
+    /// run, while preserved and no-break spaces at the edges still render.
     fn add_atomic_inline(&mut self, inner: usize) {
         self.in_collapsible_run = false;
         if inner == 0 {
@@ -210,7 +215,7 @@ fn feed_rendered_text(dom: &dyn Dom, el: ElId, out: &mut RenderedTextCount) {
                     continue;
                 }
                 if is_atomic_inline(dom, child) {
-                    let mut inner = RenderedTextCount::default();
+                    let mut inner = RenderedTextCount { keep_fixed_spaces: true, ..Default::default() };
                     feed_rendered_text(dom, child, &mut inner);
                     out.add_atomic_inline(inner.count);
                 } else {
@@ -1694,5 +1699,24 @@ mod rendered_text_tests {
             d.add_text(r, " word");
             assert_eq!(rendered_text_len(&d, r), "word word word".len(), "{tag}");
         }
+
+        // Edge spaces that cannot collapse render inside the box: preserved
+        // ones under white-space: pre, and no-break spaces.
+        let r = two_line_p(&mut d, body);
+        d.add_text(r, "word ");
+        let pre = d.add(Some(r), "span");
+        d.set_style(pre, "display", "inline-block");
+        d.set_style(pre, "whiteSpace", "pre");
+        d.add_text(pre, " word ");
+        d.add_text(r, " word");
+        assert_eq!(rendered_text_len(&d, r), "word  word  word".len());
+
+        let r = two_line_p(&mut d, body);
+        d.add_text(r, "word ");
+        let nbsp = d.add(Some(r), "span");
+        d.set_style(nbsp, "display", "inline-block");
+        d.add_text(nbsp, "\u{a0}word\u{a0}");
+        d.add_text(r, " word");
+        assert_eq!(rendered_text_len(&d, r), "word _word_ word".len());
     }
 }
