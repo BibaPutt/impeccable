@@ -535,7 +535,7 @@ re!(
 re!(STRIPE_CHILD_ROUNDED_FULL_RE, format!("{B}rounded-full{B}"));
 re!(
     STRIPE_CHILD_CUE_RE,
-    format!("{B}(?:shrink-0|rounded-[lres](?:-{W}+)?|left-0|right-0|inset-y-0){B}")
+    format!("{B}(?:shrink-0|rounded-[lres](?:-{W}+)?|left-0|right-0|inset-0|inset-y-0){B}")
 );
 
 /// Hyphen-safe class-token boundary: the byte before `index` must not be `-`
@@ -1533,11 +1533,11 @@ mod tests {
 
     #[test]
     fn stripe_child_cues_require_complete_class_tokens() {
-        for cue in ["left-0.5", "right-0.5", "inset-y-0.5", "-left-0", "left-0/2", "shrink-0.5"] {
+        for cue in ["left-0.5", "right-0.5", "inset-0.5", "inset-y-0.5", "-left-0", "left-0/2", "shrink-0.5"] {
             let source = format!(r#"<div className="w-1 {cue} bg-amber-500" />"#);
             assert!(run("side-tab", &source).is_empty(), "{cue}");
         }
-        for cue in ["left-0", "right-0", "inset-y-0", "shrink-0", "rounded-l-lg"] {
+        for cue in ["left-0", "right-0", "inset-0", "inset-y-0", "shrink-0", "rounded-l-lg"] {
             let source = format!(r#"<div className="w-1 {cue} bg-amber-500" />"#);
             assert_eq!(run("side-tab", &source).len(), 1, "{cue}");
         }

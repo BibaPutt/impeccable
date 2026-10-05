@@ -494,7 +494,8 @@ pub fn check_element_stripe_child(el: &StaticElement<'_>, style: &StyleValues) -
         return Vec::new();
     }
 
-    let width = css_length_to_px(sv(style, "width")).unwrap_or_else(|| pf0(sv(style, "width")));
+    // Only absolute lengths count: `8%` or `10vw` is not a pixel width.
+    let width = css_length_to_px(sv(style, "width")).unwrap_or(0.0);
     let position = js::to_lower_case(sv(style, "position"));
     let height_raw = js::to_lower_case(sv(style, "height"));
     // Height is not inherited, so initial and unset both reset it to auto.

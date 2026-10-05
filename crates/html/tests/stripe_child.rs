@@ -210,3 +210,28 @@ fn row_reverse_first_child_is_right() {
     assert_eq!(hits.len(), 1);
     assert!(hits[0].contains("stripe child (right)"));
 }
+
+#[test]
+fn relative_widths_are_not_pixel_stripes() {
+    for width in ["8%", "10vw", "4px"] {
+        let html = format!(r#"<html><body><div style="position:relative;width:320px;height:100px">
+<div style="position:absolute;inset:0 auto 0 0;width:{width};background:#3b82f6"></div>
+</div></body></html>"#);
+        let expected = usize::from(width == "4px");
+        assert_eq!(side_tab_snippets(&html).len(), expected, "width {width}");
+    }
+}
+
+#[test]
+fn flex_shorthands_set_direction_and_alignment() {
+    let page = |host: &str, child: &str| {
+        format!(r#"<html><body><div style="display:flex;{host}width:320px;height:100px">
+<div style="width:4px;{child}background:#f59e0b"></div><div>Content</div>
+</div></body></html>"#)
+    };
+    assert!(side_tab_snippets(&page("flex-flow:column wrap;", "")).is_empty());
+    assert!(side_tab_snippets(&page("place-items:center;", "")).is_empty());
+    assert!(side_tab_snippets(&page("", "place-self:center;")).is_empty());
+    assert_eq!(side_tab_snippets(&page("flex-flow:wrap;", "")).len(), 1);
+    assert_eq!(side_tab_snippets(&page("flex-direction:column;flex-flow:wrap;", "")).len(), 1);
+}

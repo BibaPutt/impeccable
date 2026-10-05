@@ -257,6 +257,29 @@ fn extra_specified_expansions(prop: &str, value: &str) -> Vec<Expanded> {
         "flex-direction" => vec![("flexDirection".into(), v.to_string())],
         "align-items" => vec![("alignItems".into(), v.to_string())],
         "align-self" => vec![("alignSelf".into(), v.to_string())],
+        // Shorthands reset what they omit: `flex-flow: wrap` is a row.
+        "flex-flow" => {
+            let direction = split_css_tokens(v)
+                .into_iter()
+                .find(|t| {
+                    matches!(
+                        js::to_lower_case(t).as_str(),
+                        "row" | "row-reverse" | "column" | "column-reverse"
+                    )
+                })
+                .unwrap_or_else(|| "row".to_string());
+            vec![("flexDirection".into(), direction)]
+        }
+        "place-items" => split_css_tokens(v)
+            .into_iter()
+            .next()
+            .map(|t| vec![("alignItems".into(), t)])
+            .unwrap_or_default(),
+        "place-self" => split_css_tokens(v)
+            .into_iter()
+            .next()
+            .map(|t| vec![("alignSelf".into(), t)])
+            .unwrap_or_default(),
         "inset" => {
             let vals = expand_static_box_values(&split_css_tokens(v));
             vec![
