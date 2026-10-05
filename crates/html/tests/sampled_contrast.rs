@@ -104,9 +104,13 @@ fn a_label_replaced_by_its_image_is_not_measured() {
     // does), so the skip under test is the one that decides.
     let banner = ".banner { background: url(dark.png); color: #262421; }";
     for (hide, body) in [
-        // The classic replacement: the text is thrown out of its box.
+        // The classic replacements: the text is thrown out of its box.
         (
             ".banner { text-indent: -9999px; overflow: hidden; }",
+            "<h1 class=banner>Acme Tools</h1>",
+        ),
+        (
+            ".banner { text-indent: 100%; white-space: nowrap; overflow: hidden; }",
             "<h1 class=banner>Acme Tools</h1>",
         ),
         // text-indent inherits: the label may sit in a child.
@@ -138,23 +142,27 @@ fn a_label_replaced_by_its_image_is_not_measured() {
             ".banner { text-indent: 2em; }",
             "<h1 class=banner>Acme Tools</h1>",
         ),
-        // The `100%` form is not modelled: it is measured like any text.
-        (
-            ".banner { text-indent: 100%; white-space: nowrap; overflow: hidden; }",
-            "<h1 class=banner>Acme Tools</h1>",
-        ),
     ] {
         let found = site.contrast(&format!("{banner} {shown}"), body);
         assert!(sampled_on("dark.png", &found), "{shown} {body}: {found:?}");
     }
-    // A far indent above the text keeps the skip even where a descendant
-    // resets it: whether the reset shows the text takes box types the
-    // engine does not have, and the sampler stays silent when it cannot know.
-    let reset = site.contrast(
-        &format!("{banner} .banner {{ text-indent: -9999px; }} .banner p {{ text-indent: 0; }}"),
-        "<div class=banner><p>Acme Tools</p></div>",
-    );
-    assert!(reset.is_empty(), "{reset:?}");
+    // Such an indent keeps the skip even where a descendant resets it, or
+    // where a `100%` indent could wrap back into view: telling takes box
+    // types and line layout the engine does not have, and the sampler stays
+    // silent when it cannot know.
+    for (limit, body) in [
+        (
+            ".banner { text-indent: -9999px; } .banner p { text-indent: 0; }",
+            "<div class=banner><p>Acme Tools</p></div>",
+        ),
+        (
+            ".banner { text-indent: 100%; overflow: hidden; }",
+            "<h1 class=banner>Acme Tools</h1>",
+        ),
+    ] {
+        let found = site.contrast(&format!("{banner} {limit}"), body);
+        assert!(found.is_empty(), "{limit} {body}: {found:?}");
+    }
 }
 
 #[test]

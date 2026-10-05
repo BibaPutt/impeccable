@@ -673,23 +673,27 @@ fn sampled_image_contrast(
 }
 
 /// Text hidden on purpose over the image that stands in for it: a
-/// visually-hidden label, `font-size: 0`, or a `text-indent` of `-9999px`
-/// and the like on the element or anything above it. The image is the
-/// label, so there is no contrast to measure. A browser can tell by the
-/// boxes (the DOM path never measures one under 10px); a file scan has none
-/// and goes by the declarations that make them.
+/// visually-hidden label, `font-size: 0`, or a `text-indent` that throws
+/// the first line out of its box (`-9999px`, or `100%`) on the element or
+/// anything above it. The image is the label, so there is no contrast to
+/// measure. A browser can tell by the boxes (the DOM path never measures one
+/// under 10px); a file scan has none and goes by the declarations that make
+/// them.
 ///
-/// A far indent anywhere above the text is taken at its word. Whether a
-/// descendant that resets it shows its text again depends on box types the
-/// static engine does not have, and so does the `text-indent: 100%` form
-/// (wrapping, clipping), so neither is modelled: the first keeps the skip,
-/// the second is measured like any other text.
+/// Such an indent is taken at its word. Whether a descendant that resets it
+/// shows its text again, or text indented by `100%` wraps back into view,
+/// depends on box types and line layout the static engine does not have, so
+/// neither is modelled and both keep the skip: the sampler stays silent
+/// where it cannot know.
 fn replaced_by_its_image(el: &StaticElement<'_>) -> bool {
     let style = el.style();
     is_visually_hidden(el, style)
         || parse_float(sv(style, "fontSize")) == 0.0
-        || std::iter::successors(Some(*el), |e| e.parent_element())
-            .any(|e| parse_float(sv(e.style(), "textIndent")) <= -999.0)
+        || std::iter::successors(Some(*el), |e| e.parent_element()).any(|e| {
+            let indent = js::trim(sv(e.style(), "textIndent"));
+            let amount = parse_float(indent);
+            amount <= -999.0 || (indent.ends_with('%') && amount >= 100.0)
+        })
 }
 
 /// JS: checks.mjs#checkElementHoverContrast(el, style, tag, window)
