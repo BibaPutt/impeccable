@@ -33,11 +33,11 @@ fn response_capture_reads_original_bytes_and_preserves_repeated_url_ambiguity() 
                 if number == 0 { vec![0, 255, 13, 128, 42] } else { vec![99, 4, 0, 128] },
             ))
         }
-        "/favicon.ico" => {
+        "/icon.png" | "/favicon.ico" => {
             icons.fetch_add(1, Ordering::SeqCst);
             None
         }
-        _ => Some(("text/html", b"<!doctype html><title>capture</title><body>fixture</body>".to_vec())),
+        _ => Some(("text/html", b"<!doctype html><title>capture</title><link rel=icon href=/icon.png><body>fixture</body>".to_vec())),
     });
     let Some(mut browser) = launch(&exe) else { return; };
     let mut page = browser.new_page().unwrap();
@@ -47,16 +47,17 @@ fn response_capture_reads_original_bytes_and_preserves_repeated_url_ambiguity() 
     );
     page.begin_response_capture().unwrap();
     page.goto(&origin, "load", Duration::from_secs(15)).unwrap();
-    // Chrome fetches the tab icon after load, on its own schedule. Let it land
-    // (when this Chrome sends one) so everything below covers it: it is the
-    // browser's request, not the page's, and must not read as a page change.
+    // Chrome fetches the declared tab icon after load, on its own schedule.
+    // Wait for it so everything below covers it: it is the browser's request,
+    // not the page's, and must not read as a page dependency or a change.
     let waited = Instant::now();
-    while icon_requests.load(Ordering::SeqCst) == 0 && waited.elapsed() < Duration::from_secs(5) {
+    while icon_requests.load(Ordering::SeqCst) == 0 && waited.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(icon_requests.load(Ordering::SeqCst) > 0, "the browser never fetched the declared icon");
     page.evaluate_value("true").unwrap();
     assert!(
-        page.observed_response_urls().unwrap().iter().all(|u| !u.ends_with("/favicon.ico")),
+        page.observed_response_urls().unwrap().iter().all(|u| !u.ends_with("/icon.png") && !u.ends_with("/favicon.ico")),
         "the browser's icon fetch is not a page dependency"
     );
     page.evaluate_value("fetch('/asset.bin').then(r=>r.arrayBuffer()).then(()=>true)")

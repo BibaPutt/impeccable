@@ -10,10 +10,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -192,6 +192,8 @@ impl HtmlSnapshot {
         let worker_stop = stop.clone();
         let snapshot = self.clone();
         let worker_host = host.clone();
+        let connections = Connections::default();
+        let worker_connections = connections.clone();
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -200,9 +202,11 @@ impl HtmlSnapshot {
                     // of those must not hold the page's requests behind its
                     // read timeout.
                     Ok((mut stream, _)) => {
+                        worker_connections.track(&stream);
                         let (host, snapshot) = (worker_host.clone(), snapshot.clone());
                         thread::spawn(move || {
                             let _ = respond(&mut stream, &host, &snapshot, scripts);
+                            let _ = stream.shutdown(Shutdown::Write);
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -217,6 +221,7 @@ impl HtmlSnapshot {
             entry: self.entry.clone(),
             stop,
             worker: Some(worker),
+            connections,
         })
     }
 }
@@ -324,11 +329,28 @@ fn encode_path(path: &str) -> String {
         })
         .collect()
 }
+/// The server's accepted sockets, so dropping the server ends every connection
+/// thread at once instead of leaving idle ones to their read timeout.
+#[derive(Clone, Default)]
+pub struct Connections(Arc<Mutex<Vec<TcpStream>>>);
+impl Connections {
+    pub fn track(&self, stream: &TcpStream) {
+        if let Ok(handle) = stream.try_clone() {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+        }
+    }
+    pub fn close_all(&self) {
+        for stream in self.0.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
 pub struct SnapshotServer {
     host: String,
     entry: String,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    connections: Connections,
 }
 impl SnapshotServer {
     pub fn entry_url(&self) -> String {
@@ -341,6 +363,7 @@ impl Drop for SnapshotServer {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.connections.close_all();
     }
 }
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
