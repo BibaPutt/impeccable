@@ -384,6 +384,7 @@ pub fn apply_static_declaration<K: Hash + Eq>(
     let map = specified.map.entry(node).or_default();
     let mut expanded = expand_static_declaration(prop, value);
     expanded.extend(expand_border_radius_corners(prop, value));
+    expanded.extend(super::shorthand::expand_background_color_reset(prop, value));
     expanded.extend(internal_border_style_expansion(prop, value));
     expanded.extend(extra_specified_expansions(prop, value));
     for (expanded_prop, expanded_value) in expanded {

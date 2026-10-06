@@ -220,6 +220,38 @@ fn box4(names: [&str; 4], vals: [String; 4]) -> Vec<Expanded> {
     ]
 }
 
+/// The `backgroundColor` reset a `background` shorthand with an image but no
+/// color implies (issue #964): `.hero { background: #111 }` then
+/// `.hero.photo { background: url(photo.jpg) center / cover }` paints
+/// transparent under the image in a browser, but the static cascade kept
+/// `#111`. Entered beside the expansion in `apply_static_declaration`, never
+/// inside `expand_static_declaration` (pinned by recorded vectors), carrying
+/// the shorthand's cascade metadata so later rules still win.
+pub fn expand_background_color_reset(prop: &str, value: &str) -> Vec<Expanded> {
+    if js::to_lower_case(prop) != "background" {
+        return Vec::new();
+    }
+    let v = js::trim(value);
+    if v.is_empty() || VAR_ANYWHERE_RE.is_match(v) {
+        return Vec::new();
+    }
+    let has_image = BG_IMAGE_RE.is_match(v);
+    if !has_image {
+        return Vec::new();
+    }
+    let before_image: &str = match BG_IMAGE_SPLIT_RE.find(v) {
+        Some(m) => &v[..m.start()],
+        None => v,
+    };
+    if !extract_static_color(before_image).is_empty() {
+        return Vec::new();
+    }
+    // Also check full value for trailing color? Keep parity with expansion
+    // which only reads before_image; a color after the image is not a
+    // standard background-color position and stays unresolved.
+    vec![("backgroundColor".into(), "rgba(0, 0, 0, 0)".into())]
+}
+
 /// JS: css-cascade.mjs#expandStaticDeclaration(prop, value)
 pub fn expand_static_declaration(prop: &str, value: &str) -> Vec<Expanded> {
     let p = js::to_lower_case(prop);

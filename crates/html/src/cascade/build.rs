@@ -619,6 +619,9 @@ fn compute_styles(
         }
 
         // Hover pass: color / backgroundColor only.
+        // #964: a hover color reset that arrives with an image in the same
+        // rule (background: url(...) / linear-gradient(...)) must not count
+        // as a transparent surface change.
         if let Some(hover_map) = hover_specified.get(&node) {
             let mut hover_values: Option<StyleValues> = None;
             for prop in ["color", "backgroundColor"] {
@@ -628,6 +631,23 @@ fn compute_styles(
                 let resting = specified_map.get(prop).map(|d| &d.meta);
                 if !compare_static_priority(resting, &hover_decl.meta) {
                     continue;
+                }
+                if prop == "backgroundColor" {
+                    let vv = js::trim(&hover_decl.value);
+                    let is_transparent_reset = vv == "rgba(0, 0, 0, 0)"
+                        || js::to_lower_case(vv) == "transparent";
+                    if is_transparent_reset {
+                        if let Some(img_decl) = hover_map.get("backgroundImage") {
+                            let iv = js::to_lower_case(js::trim(&img_decl.value));
+                            if iv.contains("url(") || iv.contains("gradient") {
+                                let resting_img =
+                                    specified_map.get("backgroundImage").map(|d| &d.meta);
+                                if compare_static_priority(resting_img, &img_decl.meta) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                 }
                 let next = normalize_static_css_value(
                     prop,

@@ -197,8 +197,7 @@ fn unwrap_css_at_layer_shapes() {
 }
 
 #[test]
-fn checks_shim_helpers() {
-    let mut props = CustomProps::new();
+fn checks_shim_helpers() {    let mut props = CustomProps::new();
     props.insert("--a".into(), "var(--b)".into());
     props.insert("--b".into(), "#fff".into());
     props.insert("--loop".into(), "var(--loop)".into());
@@ -220,4 +219,28 @@ fn checks_shim_helpers() {
     assert_eq!(resolve_length_px("2em", 10.0), Some(20.0));
     assert_eq!(resolve_length_px("50%", 10.0), Some(5.0));
     assert_eq!(resolve_length_px("1.5", 10.0), Some(15.0));
+}
+
+#[test]
+fn bg_image_shorthand_resets_stale_color_964() {
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1);
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(photo.jpg) center / cover",
+        &m2,
+    );
+    let map = s.get(&"n").unwrap();
+    assert_eq!(
+        map.get("backgroundImage").unwrap().value,
+        "url(photo.jpg) center / cover"
+    );
+    assert_eq!(
+        map.get("backgroundColor").unwrap().value,
+        "rgba(0, 0, 0, 0)"
+    );
 }
