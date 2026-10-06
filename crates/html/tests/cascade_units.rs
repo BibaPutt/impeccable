@@ -1,11 +1,20 @@
 //! Unit tests for the cascade helpers without recorded vectors. Expected
 //! values were produced by running the JS `css-cascade.mjs` in Node.
 
+use impeccable_core::checks::css_scan::CustomProps as RootProps;
 use impeccable_html::cascade::checks_shim::{resolve_length_px, resolve_var_refs, CustomProps};
 use impeccable_html::cascade::rules::{
     apply_static_declaration, parse_static_style_attribute, DeclMeta, SpecifiedStore,
 };
 use impeccable_html::cascade::values::{normalize_color_for_check, unwrap_css_at_layer};
+
+fn root(vars: &[(&str, &str)]) -> RootProps {
+    let mut r = RootProps::new();
+    for (k, v) in vars {
+        r.set(k, v.to_string());
+    }
+    r
+}
 
 #[test]
 fn normalize_color_for_check_matches_node() {
@@ -56,8 +65,9 @@ fn meta(important: bool, specificity: [u32; 3], order: i64, inline: bool) -> Dec
 fn apply_static_declaration_matches_node() {
     let mut specified: SpecifiedStore<&str> = SpecifiedStore::new();
     let node = "n1";
+    let root = root(&[]);
     let mut apply = |prop: &str, value: &str, m: DeclMeta| {
-        apply_static_declaration(&mut specified, node, prop, value, &m);
+        apply_static_declaration(&mut specified, node, prop, value, &m, &root);
     };
     apply("margin", "0", meta(false, [0, 0, 0], 0, false));
     apply("margin-top", "5px", meta(false, [0, 1, 0], 1, false));
@@ -227,13 +237,15 @@ fn bg_image_shorthand_resets_stale_color_964() {
     let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
     let m1 = meta(false, [0, 1, 0], 0, false);
     let m2 = meta(false, [0, 2, 0], 1, false);
-    apply_static_declaration(&mut s, "n", "background", "#111", &m1);
+    let root = root(&[]);
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &root);
     apply_static_declaration(
         &mut s,
         "n",
         "background",
         "url(photo.jpg) center / cover",
         &m2,
+        &root,
     );
     let map = s.get(&"n").unwrap();
     assert_eq!(
@@ -244,40 +256,145 @@ fn bg_image_shorthand_resets_stale_color_964() {
         map.get("backgroundColor").unwrap().value,
         "rgba(0, 0, 0, 0)"
     );
+    // The implied transparent is the auto-reset, not an author color: the
+    // hover pass keys on this flag.
+    assert!(map.get("backgroundColor").unwrap().shorthand_reset);
 }
 
 /// A color after the image is a real surface (`url(photo.jpg) #111` paints
-/// the color beneath it), so no reset may fire. A var() confined to
-/// size/repeat territory (`center / var(--size)`) cannot name a color, so
-/// the stale color still resets; a var anywhere else blocks it.
+/// the color beneath it) and must reach `backgroundColor` itself — the
+/// frozen expansion never reads past the first image, so without this a
+/// prior rule's color would outlive the browser's own paint.
 #[test]
-fn bg_shorthand_reset_keeps_trailing_color_and_size_vars() {
+fn bg_shorthand_trailing_color_reaches_background_color() {
     let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
     let m1 = meta(false, [0, 1, 0], 0, false);
     let m2 = meta(false, [0, 2, 0], 1, false);
-    let m3 = meta(false, [0, 3, 0], 2, false);
-    apply_static_declaration(&mut s, "n", "background", "#111", &m1);
-    apply_static_declaration(&mut s, "n", "background", "url(photo.jpg) #111", &m2);
-    assert_eq!(s.get(&"n").unwrap().get("backgroundColor").unwrap().value, "#111");
+    let root = root(&[]);
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &root);
+    apply_static_declaration(&mut s, "n", "background", "url(photo.jpg) #111", &m2, &root);
+    let decl = s.get(&"n").unwrap().get("backgroundColor").unwrap();
+    assert_eq!(decl.value, "#111");
+    // Author-written, so not flagged as an auto-reset.
+    assert!(!decl.shorthand_reset);
+}
 
+/// Vars are decided with the stylesheet's custom properties: a resolvable
+/// size var lets the reset fire, and a resolvable color var in another
+/// layer stops it. Anything still var-shaped after substitution (including
+/// post-slash vars, which may legally be colors) leaves the cascade alone.
+#[test]
+fn bg_shorthand_reset_resolves_vars_layer_by_layer() {
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+
+    // --size: cover resolves, so the image-only layer is transparent.
     let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
-    apply_static_declaration(&mut s, "n", "background", "#111", &m1);
+    let sized = root(&[("--size", "cover")]);
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &sized);
     apply_static_declaration(
         &mut s,
         "n",
         "background",
         "url(photo.jpg) center / var(--size)",
         &m2,
+        &sized,
     );
     assert_eq!(
         s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
         "rgba(0, 0, 0, 0)"
     );
 
+    // An unresolvable size var may still be a color where it sits: keep
+    // the earlier surface rather than wiping it.
     let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
-    apply_static_declaration(&mut s, "n", "background", "#111", &m1);
-    apply_static_declaration(&mut s, "n", "background", "var(--bg) url(y.png)", &m3);
-    // The frozen expansion carries the var through as the color and the
-    // reset stays out of its way: it may resolve to a color later.
-    assert_eq!(s.get(&"n").unwrap().get("backgroundColor").unwrap().value, "var(--bg)");
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &root(&[]));
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(photo.jpg) center / var(--size)",
+        &m2,
+        &root(&[]),
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "#111"
+    );
+
+    // A color-bearing layer: --bg resolves to red, so no reset wipes it.
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    let colored = root(&[("--bg", "red")]);
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &colored);
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(a.png) center / cover, var(--bg) url(b.png)",
+        &m2,
+        &colored,
+    );
+    // The original spelling is stored; the compute pass re-resolves it
+    // against the element's own custom properties.
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "var(--bg)"
+    );
+
+    // The same layer without a resolvable var blocks the reset outright.
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &root(&[]));
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(a.png) center / cover, var(--bg) url(b.png)",
+        &m2,
+        &root(&[]),
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "#111"
+    );
+
+    // The frozen expansion already carries a whole-value var through as the
+    // color; the reset stays out of its way entirely.
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &root(&[]));
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "var(--bg) url(y.png)",
+        &m2,
+        &root(&[]),
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "var(--bg)"
+    );
+}
+
+/// A `)` inside an image function is part of the filename — quoted
+/// (`url("photo)red.png")`) or parser-escaped (`url(photo\)red.png)`) —
+/// never the function's end; mistaking one for a boundary reads `red` as
+/// the layer's color and skips a reset that should fire.
+#[test]
+fn bg_shorthand_reset_survives_parens_inside_filenames() {
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+    for image in [
+        "url(\"photo)red.png\") center / cover",
+        "url(photo\\)red.png) center / cover",
+    ] {
+        let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+        apply_static_declaration(&mut s, "n", "background", "#111", &m1, &root(&[]));
+        apply_static_declaration(&mut s, "n", "background", image, &m2, &root(&[]));
+        assert_eq!(
+            s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+            "rgba(0, 0, 0, 0)",
+            "image {:?}",
+            image
+        );
+    }
 }

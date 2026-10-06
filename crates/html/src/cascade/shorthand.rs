@@ -225,10 +225,53 @@ static BG_FUNC_START_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("BG_FUNC_START_RE")
 });
 
+/// `bytes[i]` starts a UTF-8 sequence; the byte length of a `\` escape's
+/// target must be counted in characters, or a later slice lands mid-char.
+fn utf8_char_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
+/// Index just past a backslash escape at `i` (`bytes[i] == b'\\'`).
+fn skip_css_escape(bytes: &[u8], i: usize) -> usize {
+    let after = i + 1;
+    if after >= bytes.len() {
+        return after;
+    }
+    after + utf8_char_len(bytes[after])
+}
+
+/// Index just past the quoted string opening at `i` (its closing quote
+/// included); an unterminated string ends at the last byte.
+fn skip_css_string(bytes: &[u8], i: usize) -> usize {
+    let quote = bytes[i];
+    let mut j = i + 1;
+    while j < bytes.len() && bytes[j] != quote {
+        if bytes[j] == b'\\' {
+            j = skip_css_escape(bytes, j);
+        } else {
+            j += 1;
+        }
+    }
+    (j + 1).min(bytes.len())
+}
+
 /// `value` with every `url(...)` and gradient function removed, parens
 /// balanced, so a color can be read wherever it sits outside them, before or
-/// after the image. Byte indexing is safe: every slice point is an ASCII
-/// paren or the end of the string.
+/// after the image. Quotes and backslash escapes count: in
+/// `url("photo)red.png")` and the parser-emitted `url(photo\)red.png)` the
+/// inner `)` belongs to the filename, not to the function boundary. Byte
+/// indexing is safe: every slice point is an ASCII paren, quote or the end
+/// of the string.
 fn strip_background_image_functions(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
@@ -239,9 +282,19 @@ fn strip_background_image_functions(value: &str) -> String {
         let mut idx = m.start();
         while idx < bytes.len() {
             match bytes[idx] {
+                b'\\' => {
+                    idx = skip_css_escape(bytes, idx);
+                    continue;
+                }
+                b'"' | b'\'' => {
+                    idx = skip_css_string(bytes, idx);
+                    continue;
+                }
                 b'(' => depth += 1,
                 b')' => {
-                    depth -= 1;
+                    if depth > 0 {
+                        depth -= 1;
+                    }
                     if depth == 0 {
                         idx += 1;
                         break;
@@ -257,43 +310,118 @@ fn strip_background_image_functions(value: &str) -> String {
     out
 }
 
-/// The `backgroundColor` reset a `background` shorthand with an image but no
-/// color implies (issue #964): `.hero { background: #111 }` then
+/// A shorthand's layers: split on commas outside parens and quotes, so
+/// `url(a,b.png) center / cover, var(--bg)` is two layers and the comma in
+/// the filename is not one.
+fn split_background_layers(value: &str) -> Vec<&str> {
+    let bytes = value.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i = skip_css_escape(bytes, i);
+                continue;
+            }
+            b'"' | b'\'' => {
+                i = skip_css_string(bytes, i);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            b',' if depth == 0 => {
+                parts.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+/// The `backgroundColor` a `background` shorthand with an image implies
+/// (issue #964): `.hero { background: #111 }` then
 /// `.hero.photo { background: url(photo.jpg) center / cover }` paints
 /// transparent under the image in a browser, but the static cascade kept
 /// `#111`. Entered beside the expansion in `apply_static_declaration`, never
 /// inside `expand_static_declaration` (pinned by recorded vectors), carrying
 /// the shorthand's cascade metadata so later rules still win.
-pub fn expand_background_color_reset(prop: &str, value: &str) -> Vec<Expanded> {
+///
+/// Returns `[prop, value, isReset]`:
+/// - a color the author wrote — before the image, after it, or in another
+///   layer — is a real surface; it enters without the reset flag, so the
+///   hover pass never treats it as auto-cleared.
+/// - only the implied `transparent` carries `isReset`.
+///
+/// `root` supplies custom properties for a decision-time substitution:
+/// `var(--bg)` colors are then recognized instead of vetoing the whole
+/// declaration, and a `var()` that survives resolution anywhere in a layer
+/// may still be a color or a size — the surface is unknown, so the cascade
+/// is left alone.
+pub fn expand_background_color_reset(
+    prop: &str,
+    value: &str,
+    root: &impeccable_core::checks::css_scan::CustomProps,
+) -> Vec<(String, String, bool)> {
     if js::to_lower_case(prop) != "background" {
         return Vec::new();
     }
     let v = js::trim(value);
-    if v.is_empty() {
+    if v.is_empty() || !BG_IMAGE_RE.is_match(v) {
         return Vec::new();
     }
-    let has_image = BG_IMAGE_RE.is_match(v);
-    if !has_image {
+    let resolved = if VAR_ANYWHERE_RE.is_match(v) {
+        let lookup = |name: &str| root.get(name).cloned();
+        impeccable_core::checks::measures::resolve_var_refs(v, &lookup, 0)
+    } else {
+        v.to_string()
+    };
+    let layers_v = split_background_layers(v);
+    let layers_r = split_background_layers(&resolved);
+    // A custom property whose value itself contains a comma changes the
+    // layer count; mapping a color back to its layer stops being reliable,
+    // so leave the cascade alone.
+    if layers_v.len() != layers_r.len() {
         return Vec::new();
     }
-    // A color after the image is valid CSS (`url(photo.jpg) #111` paints the
-    // color beneath it), so read the whole value outside the image functions
-    // rather than only the part before the first one.
-    let remainder = strip_background_image_functions(v);
-    if !extract_static_color(&remainder).is_empty() {
-        return Vec::new();
-    }
-    // A var() may resolve to a color later, except in size/repeat territory:
-    // everything after the first '/' of the layer cannot name the surface
-    // (`center / var(--size)` with `--size: cover`), so only a var before
-    // any '/' blocks the reset.
-    if VAR_ANYWHERE_RE.is_match(&remainder) {
-        let head = remainder.split('/').next().unwrap_or("");
-        if VAR_ANYWHERE_RE.is_match(head) {
+    // The shorthand's color comes from the layer that carries one; keep the
+    // original spelling (a `var()` the compute pass resolves against the
+    // element's own custom properties) beside the decision.
+    let mut found: Option<(String, String)> = None;
+    for (layer_v, layer_r) in layers_v.iter().zip(layers_r.iter()) {
+        let rem_r = strip_background_image_functions(layer_r);
+        if VAR_ANYWHERE_RE.is_match(&rem_r) {
             return Vec::new();
         }
+        let color_r = extract_static_color(&rem_r);
+        if color_r.is_empty() {
+            continue;
+        }
+        let color_v = extract_static_color(&strip_background_image_functions(layer_v));
+        found = Some((
+            if color_v.is_empty() {
+                color_r.clone()
+            } else {
+                color_v
+            },
+            color_r,
+        ));
     }
-    vec![("backgroundColor".into(), "rgba(0, 0, 0, 0)".into())]
+    match found {
+        // A color after the image (`url(photo.jpg) #111`) never reaches the
+        // frozen expansion, which reads only before the first image; write
+        // it here so a prior rule's surface does not outlive it.
+        Some((color_v, _)) => vec![("backgroundColor".into(), color_v, false)],
+        None => vec![("backgroundColor".into(), "rgba(0, 0, 0, 0)".into(), true)],
+    }
 }
 
 /// JS: css-cascade.mjs#expandStaticDeclaration(prop, value)

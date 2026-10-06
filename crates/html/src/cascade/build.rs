@@ -375,7 +375,14 @@ pub fn build_static_style_map(
                             order: rule.order,
                             inline: false,
                         };
-                        apply_static_declaration(store, node, &decl.prop, &decl.value, &meta);
+                        apply_static_declaration(
+                            store,
+                            node,
+                            &decl.prop,
+                            &decl.value,
+                            &meta,
+                            &root_custom_props,
+                        );
                     }
                 }
             }
@@ -398,7 +405,14 @@ pub fn build_static_style_map(
                         order: decl.order,
                         inline: true,
                     };
-                    apply_static_declaration(&mut specified, node, &decl.prop, &decl.value, &meta);
+                    apply_static_declaration(
+                        &mut specified,
+                        node,
+                        &decl.prop,
+                        &decl.value,
+                        &meta,
+                        &root_custom_props,
+                    );
                 }
                 inline_order += 1000;
             }

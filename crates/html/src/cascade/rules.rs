@@ -379,12 +379,16 @@ fn extra_specified_expansions(prop: &str, value: &str) -> Vec<Expanded> {
 }
 
 /// JS: css-cascade.mjs#applyStaticDeclaration(specified, node, prop, value, meta)
+///
+/// `root` is the stylesheet's custom properties, used by the background
+/// reset to tell a `var()` color from a `var()` size at decision time.
 pub fn apply_static_declaration<K: Hash + Eq>(
     specified: &mut SpecifiedStore<K>,
     node: K,
     prop: &str,
     value: &str,
     meta: &DeclMeta,
+    root: &impeccable_core::checks::css_scan::CustomProps,
 ) {
     let map = specified.map.entry(node).or_default();
     let mut expanded: Vec<(String, String, bool)> = expand_static_declaration(prop, value)
@@ -396,11 +400,9 @@ pub fn apply_static_declaration<K: Hash + Eq>(
             .into_iter()
             .map(|(p, v)| (p, v, false)),
     );
-    expanded.extend(
-        super::shorthand::expand_background_color_reset(prop, value)
-            .into_iter()
-            .map(|(p, v)| (p, v, true)),
-    );
+    expanded.extend(super::shorthand::expand_background_color_reset(
+        prop, value, root,
+    ));
     expanded.extend(
         internal_border_style_expansion(prop, value)
             .into_iter()
