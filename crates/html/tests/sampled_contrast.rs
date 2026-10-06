@@ -398,6 +398,15 @@ fn a_none_layer_is_skipped_and_an_unknown_one_stops() {
         );
         assert!(found.is_empty(), "{paint}: {found:?}");
     }
+    // A `display: contents` wrapper paints no box: its image is not the
+    // ground, and its color does not hide the image behind it.
+    let body = "<div class=hero><div class=wrap><p>White copy under a wrapper that paints no box</p></div></div>";
+    let unpainted = ".hero { background: #111; } .wrap { display: contents; background: url(light.png); } p { color: #fdfdfd; }";
+    let found = site.contrast(unpainted, body);
+    assert!(found.is_empty(), "{found:?}");
+    let behind = ".hero { background: url(light.png); } .wrap { display: contents; background: #111; } p { color: #fdfdfd; }";
+    assert!(sampled_on("light.png", &site.contrast(behind, body)));
+    let body = "<div class=hero><p>White copy on a layered background</p></div>";
     // Nor is a url that is another image function's argument: which
     // candidate paints, or what the blend looks like, is not known here.
     for image in [

@@ -860,6 +860,11 @@ pub struct ImageLayer {
 /// The paint of one element, in isolation from its ancestors.
 pub fn analyze_level(cur: &StaticElement<'_>) -> LevelPaint {
     let style = cur.style();
+    // `display: contents` generates no box: its fill and its image paint
+    // nowhere, and the walk reads past it, as the analytic walk does.
+    if paints_no_box(style) {
+        return LevelPaint::Through(Vec::new());
+    }
     let bg = level_background_color(cur, style, None);
     if bg.is_none() && !is_no_paint_color_value(sv_opt(style, "backgroundColor")) {
         return LevelPaint::Stop;
@@ -1217,6 +1222,14 @@ mod tests {
             ),
             // No image anywhere.
             (".x { color: red; }", false, None),
+            // A `display: contents` box paints nothing: its own image is not
+            // a ground, and it does not hide the one behind it.
+            (".x { display: contents; background: url(a.png); }", false, None),
+            (
+                "section { background: url(a.png); } .x { display: contents; background: #111; }",
+                true,
+                Some(false),
+            ),
             // A color as the final layer of the list is the color, in
             // either walk.
             (".x { background: url(a.png), #111; }", false, Some(true)),
