@@ -347,6 +347,67 @@ fn split_background_layers(value: &str) -> Vec<&str> {
     parts
 }
 
+/// Index just past the balanced `var(...)` whose `(` sits at `open_paren`;
+/// the end of the string when the parens never close.
+fn var_span_end(bytes: &[u8], open_paren: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = open_paren;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i = skip_css_escape(bytes, i);
+                continue;
+            }
+            b'"' | b'\'' => {
+                i = skip_css_string(bytes, i);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// `rem` with every `var(...)` span blanked, so a color read from it can
+/// never be plucked out of a custom-property name (`var(--red)` reads as
+/// `red`, which the author never wrote).
+fn without_var_spans(rem: &str) -> String {
+    let mut out = String::with_capacity(rem.len());
+    let mut rest = rem;
+    while let Some(m) = VAR_ANYWHERE_RE.find(rest) {
+        out.push_str(&rest[..m.start()]);
+        out.push(' ');
+        let end = var_span_end(rest.as_bytes(), m.end() - 1);
+        rest = &rest[end.min(rest.len())..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The first `var(...)` span in `rem`, else `None`.
+fn first_var_span(rem: &str) -> Option<&str> {
+    let m = VAR_ANYWHERE_RE.find(rem)?;
+    let end = var_span_end(rem.as_bytes(), m.end() - 1);
+    Some(&rem[m.start()..end.min(rem.len())])
+}
+
+/// Whether a `var()` sits where a color may be read: before the layer's
+/// first `/`, or with no `/` at all. After the slash only position/size
+/// tokens are legal — a var resolving to a color there makes the browser
+/// drop the declaration instead of painting it.
+fn var_in_color_position(rem: &str) -> bool {
+    let slash = rem.find('/').unwrap_or(rem.len());
+    VAR_ANYWHERE_RE.find_iter(rem).any(|m| m.start() <= slash)
+}
+
 /// The `backgroundColor` a `background` shorthand with an image implies
 /// (issue #964): `.hero { background: #111 }` then
 /// `.hero.photo { background: url(photo.jpg) center / cover }` paints
@@ -361,11 +422,13 @@ fn split_background_layers(value: &str) -> Vec<&str> {
 ///   hover pass never treats it as auto-cleared.
 /// - only the implied `transparent` carries `isReset`.
 ///
-/// `root` supplies custom properties for a decision-time substitution:
-/// `var(--bg)` colors are then recognized instead of vetoing the whole
-/// declaration, and a `var()` that survives resolution anywhere in a layer
-/// may still be a color or a size — the surface is unknown, so the cascade
-/// is left alone.
+/// `root` supplies custom properties for a decision-time substitution
+/// (`var()` colors are recognized instead of vetoing the declaration), but
+/// the author's spelling is what gets stored: the compute pass re-resolves
+/// a stored `var()` against the element's own custom properties, which may
+/// scope a different value than the stylesheet-wide first one seen here.
+/// A var() that survives resolution anywhere in a layer may still be a
+/// color or a size — the surface is unknown, so the cascade is left alone.
 pub fn expand_background_color_reset(
     prop: &str,
     value: &str,
@@ -392,34 +455,57 @@ pub fn expand_background_color_reset(
     if layers_v.len() != layers_r.len() {
         return Vec::new();
     }
-    // The shorthand's color comes from the layer that carries one; keep the
-    // original spelling (a `var()` the compute pass resolves against the
-    // element's own custom properties) beside the decision.
-    let mut found: Option<(String, String)> = None;
+    let mut found: Option<String> = None;
     for (layer_v, layer_r) in layers_v.iter().zip(layers_r.iter()) {
         let rem_r = strip_background_image_functions(layer_r);
         if VAR_ANYWHERE_RE.is_match(&rem_r) {
             return Vec::new();
         }
+        let rem_v = strip_background_image_functions(layer_v);
         let color_r = extract_static_color(&rem_r);
-        if color_r.is_empty() {
+        if !VAR_ANYWHERE_RE.is_match(&rem_v) {
+            if color_r.is_empty() {
+                continue;
+            }
+            found = Some(color_r);
             continue;
         }
-        let color_v = extract_static_color(&strip_background_image_functions(layer_v));
-        found = Some((
-            if color_v.is_empty() {
-                color_r.clone()
-            } else {
-                color_v
-            },
-            color_r,
-        ));
+        // The layer holds var()s; none survive resolution (checked above).
+        if color_r.is_empty() {
+            if var_in_color_position(&rem_v) {
+                // The element may scope a color here (`.hero { --bg: red }`
+                // over a stylesheet `--bg: cover`), and a leading var()
+                // already survives in the frozen expansion — keep what the
+                // cascade has.
+                return Vec::new();
+            }
+            // A size-only var resolved to a non-color: the layer carries
+            // no surface, so the implied transparent stands.
+            continue;
+        }
+        // Store a color only in the spelling the author wrote: a literal
+        // outside the var()s, else the var() itself — never a token read
+        // from inside a custom-property name, and never the whole remainder
+        // when a var() leads it.
+        let literal = extract_static_color(&without_var_spans(&rem_v));
+        if !literal.is_empty() {
+            found = Some(literal);
+        } else if var_in_color_position(&rem_v) {
+            let span = first_var_span(&rem_v)
+                .map(str::to_string)
+                .unwrap_or_else(|| color_r.clone());
+            found = Some(span);
+        } else {
+            // The color came out of a size slot — the browser drops such a
+            // declaration rather than paint it.
+            return Vec::new();
+        }
     }
     match found {
         // A color after the image (`url(photo.jpg) #111`) never reaches the
         // frozen expansion, which reads only before the first image; write
         // it here so a prior rule's surface does not outlive it.
-        Some((color_v, _)) => vec![("backgroundColor".into(), color_v, false)],
+        Some(color) => vec![("backgroundColor".into(), color, false)],
         None => vec![("backgroundColor".into(), "rgba(0, 0, 0, 0)".into(), true)],
     }
 }

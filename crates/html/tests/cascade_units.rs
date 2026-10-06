@@ -375,6 +375,92 @@ fn bg_shorthand_reset_resolves_vars_layer_by_layer() {
     );
 }
 
+/// A stylesheet-wide custom property is only the first value seen, not the
+/// value that wins on the element: with `:root { --bg: cover }` and
+/// `.hero { --bg: red }`, resolving `var(--bg)` decision-time finds no
+/// color, but a reset to transparent would erase the element's own red.
+/// The stored value stays the var() so compute resolves it on the element.
+#[test]
+fn bg_shorthand_local_var_color_survives_stylesheet_resolution() {
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "#111",
+        &m1,
+        &root(&[("--bg", "cover")]),
+    );
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "var(--bg) url(photo.png)",
+        &m2,
+        &root(&[("--bg", "cover")]),
+    );
+    let decl = s.get(&"n").unwrap().get("backgroundColor").unwrap();
+    assert_eq!(decl.value, "var(--bg)");
+    assert!(!decl.shorthand_reset);
+}
+
+/// The stored color is the author's spelling, never a token the extractor
+/// read out of a custom-property name (`var(--red)` must not become
+/// `red`) and never the whole remainder when a var() leads it.
+#[test]
+fn bg_shorthand_emits_var_span_not_plucked_color() {
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "#111",
+        &m1,
+        &root(&[("--red", "red")]),
+    );
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(photo.png) var(--red)",
+        &m2,
+        &root(&[("--red", "red")]),
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "var(--red)"
+    );
+
+    // Frozen reads a leading var() plus trailing tokens as one string;
+    // the reset overwrites it with just the var().
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "#111",
+        &m1,
+        &root(&[("--bg", "red")]),
+    );
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "var(--bg) 50% / auto url(x.png)",
+        &m2,
+        &root(&[("--bg", "red")]),
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "var(--bg)"
+    );
+}
+
 /// A `)` inside an image function is part of the filename — quoted
 /// (`url("photo)red.png")`) or parser-escaped (`url(photo\)red.png)`) —
 /// never the function's end; mistaking one for a boundary reads `red` as
