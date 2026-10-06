@@ -1618,7 +1618,12 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                 // Overflow stays on the direct children: a grandchild box that
                 // moved past the edge still lands its text on the edge, while
                 // a direct child past the edge is clipped, not snug.
+                // Insulation through an unwrapped shell needs every child to
+                // hold its side: stacked siblings must not cancel each
+                // other's flush text (one inset sibling clearing the edge for
+                // another whose text touches it).
                 let mut effective: Vec<ElId> = children.clone();
+                let mut unwrapped = false;
                 for _ in 0..3 {
                     if effective.len() != 1 {
                         break;
@@ -1632,6 +1637,7 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                         break;
                     }
                     effective = inner;
+                    unwrapped = true;
                 }
                 for &child in &children {
                     let cr = dom.rect(child);
@@ -1650,7 +1656,9 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                         }
                     }
                 }
+                let mut eff_insulate: Vec<[bool; 4]> = Vec::with_capacity(effective.len());
                 for &child in &effective {
+                    let mut ins = [false; 4];
                     let child_pad = [
                         len(child, "paddingTop"),
                         len(child, "paddingRight"),
@@ -1666,22 +1674,39 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                     let cr = dom.rect(child);
                     if cr.width > 0.0 && cr.height > 0.0 {
                         if cr.top - rect.top >= CHILD_INSULATE_THRESHOLD {
-                            children_insulate[0] = true;
+                            ins[0] = true;
                         }
                         if rect.right - cr.right >= CHILD_INSULATE_THRESHOLD {
-                            children_insulate[1] = true;
+                            ins[1] = true;
                         }
                         if rect.bottom - cr.bottom >= CHILD_INSULATE_THRESHOLD {
-                            children_insulate[2] = true;
+                            ins[2] = true;
                         }
                         if cr.left - rect.left >= CHILD_INSULATE_THRESHOLD {
-                            children_insulate[3] = true;
+                            ins[3] = true;
                         }
                     }
                     for s in 0..4 {
                         if child_pad[s] >= CHILD_INSULATE_THRESHOLD
                             || child_margin[s] >= CHILD_INSULATE_THRESHOLD
                         {
+                            ins[s] = true;
+                        }
+                    }
+                    for s in 0..4 {
+                        if ins[s] {
+                            // Direct children keep the historical any-child
+                            // clears; unwrapped shells are resolved below.
+                            if !unwrapped {
+                                children_insulate[s] = true;
+                            }
+                        }
+                    }
+                    eff_insulate.push(ins);
+                }
+                if unwrapped && !eff_insulate.is_empty() {
+                    for s in 0..4 {
+                        if eff_insulate.iter().all(|ins| ins[s]) {
                             children_insulate[s] = true;
                         }
                     }
@@ -3042,6 +3067,83 @@ mod tests {
         assert_eq!(
             hits[0].snippet,
             "<section> \"card-frame\": children flush against border on right/left (no inset)"
+        );
+    }
+
+    /// Stacked siblings behind one transparent shell must not clear each
+    /// other's flush edge: the second paragraph sits below the top edge and
+    /// the first sits above the bottom one, but each paragraph's own text
+    /// still touches its edge.
+    #[test]
+    fn flush_stacked_siblings_behind_a_shell_still_flag() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let row = d.add(Some(body), "div");
+        d.set_attr(row, "class", "stack");
+        d.set_rect(row, 0.0, 0.0, 600.0, 100.0);
+        d.set_styles(
+            row,
+            &[
+                ("position", "static"),
+                ("display", "block"),
+                ("borderTopWidth", "1px"),
+                ("borderRightWidth", "1px"),
+                ("borderBottomWidth", "1px"),
+                ("borderLeftWidth", "1px"),
+                ("borderTopColor", "rgb(200, 200, 200)"),
+                ("borderRightColor", "rgb(200, 200, 200)"),
+                ("borderBottomColor", "rgb(200, 200, 200)"),
+                ("borderLeftColor", "rgb(200, 200, 200)"),
+                ("outlineWidth", "0px"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                ("paddingTop", "0px"),
+                ("paddingRight", "0px"),
+                ("paddingBottom", "0px"),
+                ("paddingLeft", "0px"),
+                ("fontSize", "16px"),
+            ],
+        );
+        let wrap = d.add(Some(row), "div");
+        d.set_rect(wrap, 0.0, 0.0, 600.0, 100.0);
+        d.set_styles(
+            wrap,
+            &[
+                ("display", "block"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                ("paddingTop", "0px"),
+                ("paddingRight", "0px"),
+                ("paddingBottom", "0px"),
+                ("paddingLeft", "0px"),
+                ("marginTop", "0px"),
+                ("marginRight", "0px"),
+                ("marginBottom", "0px"),
+                ("marginLeft", "0px"),
+                ("fontSize", "16px"),
+            ],
+        );
+        let zero = [
+            ("paddingTop", "0px"),
+            ("paddingRight", "0px"),
+            ("paddingBottom", "0px"),
+            ("paddingLeft", "0px"),
+            ("marginTop", "0px"),
+            ("marginRight", "0px"),
+            ("marginBottom", "0px"),
+            ("marginLeft", "0px"),
+        ];
+        let p1 = text_el(&mut d, wrap, "p", "First paragraph touches the top edge", "16px");
+        d.set_rect(p1, 0.0, 0.0, 600.0, 50.0);
+        d.set_styles(p1, &zero);
+        d.set_text_rect(p1, 24.0, 1.0, 300.0, 18.0);
+        let p2 = text_el(&mut d, wrap, "p", "Second paragraph touches the bottom edge", "16px");
+        d.set_rect(p2, 0.0, 50.0, 600.0, 50.0);
+        d.set_styles(p2, &zero);
+        d.set_text_rect(p2, 24.0, 81.0, 300.0, 18.0);
+        let hits = check_element_quality_dom(&d, row, &BrowserConfig::default());
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].snippet,
+            "<div> \"stack\": children flush against border on top/bottom (no inset)"
         );
     }
 
