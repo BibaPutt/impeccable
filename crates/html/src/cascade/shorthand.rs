@@ -364,9 +364,24 @@ pub fn background_longhands(prop: &str, value: &str) -> Vec<Expanded> {
     }
 }
 
+/// A layer token that opens with an image function other than `url()` or a
+/// gradient: an image the engine does not read (`image-set("a.png" 1x)`,
+/// `element()`, `paint()`), with or without a `var()` inside.
+fn names_unread_image(v: &str) -> bool {
+    split_css_list(v).iter().any(|layer| {
+        split_css_tokens(layer)
+            .iter()
+            .any(|token| BG_IMAGE_CALL_RE.is_match(token))
+    })
+}
+
 fn background_shorthand_longhands(v: &str) -> Vec<Expanded> {
     let has_image = BG_IMAGE_RE.is_match(v);
-    if VAR_ANYWHERE_RE.is_match(v) && !has_image {
+    let unread_image = !has_image && names_unread_image(v);
+    // A bare `var()` may resolve to anything, so it is left alone the way
+    // the expansion leaves it. A `var()` inside an image function
+    // (`paint(var(--pattern))`) still names an image.
+    if VAR_ANYWHERE_RE.is_match(v) && !has_image && !unread_image {
         return Vec::new();
     }
     if CSS_WIDE_KEYWORD_RE.is_match(v) {
@@ -384,13 +399,8 @@ fn background_shorthand_longhands(v: &str) -> Vec<Expanded> {
     if !has_image {
         // Neither a `url()` nor a gradient. A shorthand that names no image
         // clears it. One that names an image the engine does not read
-        // (`image-set("a.png" 1x)`, `element()`, `paint()`) replaces it with
-        // that value instead, and the sampled walk stops there.
-        let unread_image = split_css_list(v).iter().any(|layer| {
-            split_css_tokens(layer)
-                .iter()
-                .any(|token| BG_IMAGE_CALL_RE.is_match(token))
-        });
+        // replaces it with that value instead, and the sampled walk stops
+        // there.
         let image = if unread_image {
             v.to_string()
         } else {

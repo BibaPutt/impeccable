@@ -387,13 +387,17 @@ fn a_none_layer_is_skipped_and_an_unknown_one_stops() {
     assert!(site.contrast(custom, body).is_empty());
     // A wrapper that paints an image function the engine does not read is
     // not read through to the image behind it.
-    let wrapped = ".hero { background: url(light.png); } .mid { background: paint(dots); } \
-                   p { color: #fdfdfd; }";
-    let found = site.contrast(
-        wrapped,
-        "<div class=hero><div class=mid><p>White copy behind a painted wrapper</p></div></div>",
-    );
-    assert!(found.is_empty(), "{found:?}");
+    for paint in ["paint(dots)", "paint(var(--pattern))"] {
+        let wrapped = format!(
+            ".hero {{ background: url(light.png); }} .mid {{ background: {paint}; }} \
+             p {{ color: #fdfdfd; }}"
+        );
+        let found = site.contrast(
+            &wrapped,
+            "<div class=hero><div class=mid><p>White copy behind a painted wrapper</p></div></div>",
+        );
+        assert!(found.is_empty(), "{paint}: {found:?}");
+    }
     // Nor is a url that is another image function's argument: which
     // candidate paints, or what the blend looks like, is not known here.
     for image in [

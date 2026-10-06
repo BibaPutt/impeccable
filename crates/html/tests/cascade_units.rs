@@ -331,6 +331,14 @@ fn background_longhands_ride_beside_the_expansion() {
         ])
     );
     assert_eq!(
+        pairs("background", "paint(var(--pattern))"),
+        own(&[
+            ("backgroundRepeat", "repeat"),
+            ("backgroundSize", "auto"),
+            ("backgroundImage", "paint(var(--pattern))")
+        ])
+    );
+    assert_eq!(
         pairs("background", "image-set(\"a.png\" 1x) center / cover"),
         own(&[
             ("backgroundRepeat", "repeat"),
