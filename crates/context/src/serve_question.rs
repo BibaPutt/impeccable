@@ -263,13 +263,14 @@ enum CompRound {
 /// The missing-comp gate `--start` and `--update` share: a direction round
 /// (known by its canon exit), else a surface round when concept-seed's
 /// latest roll in this project is a surface roll no decision page has taken
-/// yet. `None` when the payload owes nothing or declares every comp it owes.
-fn missing_comps(qdir: &str, payload: &Value) -> Option<(CompRound, Vec<String>)> {
+/// yet (`roll` is the record as `read_roll` returned it). `None` when the
+/// payload owes nothing or declares every comp it owes.
+fn missing_comps(roll: Option<&str>, payload: &Value) -> Option<(CompRound, Vec<String>)> {
     let direction = missing_direction_comps(payload);
     if !direction.is_empty() {
         return Some((CompRound::Direction, direction));
     }
-    if !surface_roll_pending(qdir) {
+    if !surface_roll_pending(roll) {
         return None;
     }
     let surface = missing_surface_comps(payload);
@@ -321,20 +322,31 @@ pub fn record_roll(cwd: &str, scope: &str, key: &str, reroll: usize) {
     let _ = std::fs::create_dir_all(&qdir).and_then(|_| write_atomic(&roll_file(&qdir), &json_compact(&record)));
 }
 
-/// Whether the latest roll is a surface roll made within `ROLL_WINDOW_MS`
-/// that no decision page has taken yet.
-fn surface_roll_pending(qdir: &str) -> bool {
-    let Some(record) = safe_read(&roll_file(qdir)).and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
+/// The roll record as `--start` / `--update` read it once, before the gate:
+/// the same text decides the gate and names the record `take_roll` may
+/// remove.
+fn read_roll(qdir: &str) -> Option<String> {
+    safe_read(&roll_file(qdir))
+}
+
+/// Whether a roll record (as `read_roll` returned it) is a surface roll made
+/// within `ROLL_WINDOW_MS` that no decision page has taken yet.
+fn surface_roll_pending(roll: Option<&str>) -> bool {
+    let Some(record) = roll.and_then(|t| serde_json::from_str::<Value>(t).ok()) else {
         return false;
     };
     let fresh = record.get("at").and_then(Value::as_f64).is_some_and(|at| now_ms() - at < ROLL_WINDOW_MS);
     fresh && record.get("scope").and_then(Value::as_str) == Some("surface")
 }
 
-/// A decision page took the latest roll: the payload carries `buildPath`,
-/// which only direction and surface rounds do.
-fn take_roll(qdir: &str, payload: &Value) {
-    if payload.get("buildPath").is_some_and(|b| !b.is_null()) {
+/// A decision page took the roll it was gated against: the payload carries
+/// `buildPath`, which only direction and surface rounds do. Removes the
+/// record only while it still holds that roll (`read` is the text read
+/// before the gate), so a newer roll another session recorded in between
+/// stays bound to its own page.
+fn take_roll(qdir: &str, read: Option<&str>, payload: &Value) {
+    let Some(read) = read else { return };
+    if payload.get("buildPath").is_some_and(|b| !b.is_null()) && read_roll(qdir).as_deref() == Some(read) {
         let _ = std::fs::remove_file(roll_file(qdir));
     }
 }
@@ -894,7 +906,8 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             io.err("serve-question: --update payload needs an options array; nothing was delivered. Fix the payload and rerun --update on the same key.\n");
             return 1;
         }
-        if let Some((round, missing)) = missing_comps(&qdir, &next_round) {
+        let roll = read_roll(&qdir);
+        if let Some((round, missing)) = missing_comps(roll.as_deref(), &next_round) {
             io.err(&missing_comps_message(round, &missing, "rerun --update on the same key", "nothing was delivered"));
             return 1;
         }
@@ -910,7 +923,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             io.err(&format!("serve-question: could not record the hand ({}); nothing was delivered. Make .impeccable/questions/ writable and rerun --update on the same key.\n", e));
             return 1;
         }
-        take_roll(&qdir, &next_round);
+        take_roll(&qdir, roll.as_deref(), &next_round);
         let delivered = next_file(&qdir, &key);
         let _ = std::fs::copy(jsp::resolve(&cwd, &[&pp]), &delivered);
         touch_now(&delivered);
@@ -933,7 +946,8 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                 return 1;
             }
         };
-        if let Some((round, missing)) = missing_comps(&qdir, &start_payload) {
+        let roll = read_roll(&qdir);
+        if let Some((round, missing)) = missing_comps(roll.as_deref(), &start_payload) {
             io.err(&missing_comps_message(round, &missing, "rerun --start", "the page was not served"));
             return 1;
         }
@@ -946,7 +960,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                 return 1;
             }
         };
-        take_roll(&qdir, &start_payload);
+        take_roll(&qdir, roll.as_deref(), &start_payload);
         // The old state goes either way, so the wait below sees the new
         // server's state, not the dead one's; its pid is never signalled,
         // since a dead server's pid may have been reused.
@@ -2345,28 +2359,40 @@ mod tests {
         let dir = temp_project("surface-roll");
         let qdir = jsp::join(&[&dir.to_string_lossy(), ".impeccable", "questions"]);
         let bare = surface_round(false);
+        let gate = |p: &Value| missing_comps(read_roll(&qdir).as_deref(), p);
+        let pending = || surface_roll_pending(read_roll(&qdir).as_deref());
         // No roll recorded: the payload cannot be told from the comp round.
-        assert_eq!(missing_comps(&qdir, &bare), None);
+        assert_eq!(gate(&bare), None);
         // A fresh surface roll binds the next decision page.
         write_roll(&dir, "surface", now_ms());
-        assert_eq!(missing_comps(&qdir, &bare), Some((CompRound::Surface, vec!["ledger".into(), "rail".into(), "field".into()])));
-        assert_eq!(missing_comps(&qdir, &surface_round(true)), None);
+        assert_eq!(gate(&bare), Some((CompRound::Surface, vec!["ledger".into(), "rail".into(), "field".into()])));
+        assert_eq!(gate(&surface_round(true)), None);
         // A later direction roll replaces it; a stale one has expired.
         write_roll(&dir, "direction", now_ms());
-        assert_eq!(missing_comps(&qdir, &bare), None);
+        assert_eq!(gate(&bare), None);
         write_roll(&dir, "surface", now_ms() - ROLL_WINDOW_MS - 1000.0);
-        assert_eq!(missing_comps(&qdir, &bare), None);
+        assert_eq!(gate(&bare), None);
         // An unreadable record gates nothing.
         std::fs::write(dir.join(".impeccable/questions/roll.json"), "{not json").unwrap();
-        assert_eq!(missing_comps(&qdir, &bare), None);
+        assert_eq!(gate(&bare), None);
         // A direction round is still the direction gate's, roll or not.
         write_roll(&dir, "surface", now_ms());
-        assert_eq!(missing_comps(&qdir, &direction_round(false)).map(|(r, _)| r), Some(CompRound::Direction));
+        assert_eq!(gate(&direction_round(false)).map(|(r, _)| r), Some(CompRound::Direction));
         // Only a decision page (a payload with buildPath) takes the roll.
-        take_roll(&qdir, &json!({ "options": [{ "id": "a" }, { "id": "b" }] }));
-        assert!(surface_roll_pending(&qdir));
-        take_roll(&qdir, &surface_round(true));
-        assert!(!surface_roll_pending(&qdir));
+        let read = read_roll(&qdir);
+        take_roll(&qdir, read.as_deref(), &json!({ "options": [{ "id": "a" }, { "id": "b" }] }));
+        assert!(pending());
+        // A newer roll recorded after this page read the record (another
+        // session's) is not this page's to take.
+        write_roll(&dir, "surface", now_ms() + 1.0);
+        take_roll(&qdir, read.as_deref(), &surface_round(true));
+        assert!(pending());
+        // The roll the page was gated against is.
+        let read = read_roll(&qdir);
+        take_roll(&qdir, read.as_deref(), &surface_round(true));
+        assert!(!pending());
+        // No record read, nothing to take.
+        take_roll(&qdir, None, &surface_round(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2377,7 +2403,7 @@ mod tests {
         let roll = dir.join(".impeccable/questions/roll.json");
         // Recorded the way concept-seed records a roll.
         record_roll(&dir.to_string_lossy(), "surface", "seed-1", 0);
-        assert!(surface_roll_pending(&qdir));
+        assert!(surface_roll_pending(read_roll(&qdir).as_deref()));
         std::fs::write(dir.join("p.json"), surface_round(false).to_string()).unwrap();
         let run_err = |args: &[&str]| {
             let env = Env::from([("IMPECCABLE_SKILL_DIR".into(), "/skill".into())]);
