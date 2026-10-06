@@ -156,6 +156,59 @@ pub fn has_visible_background_boundary(dom: &dyn Dom, el: ElId) -> bool {
     !colors_nearly_match(Some(&bg), Some(CANVAS_BACKGROUND))
 }
 
+/// A padding-free wrapper with no edge of its own (issue #963): no visible
+/// border, outline or background, no direct text, not a table part, not
+/// positioned, not a scroll/clip container. Its children render where its own
+/// box does, so the flush rule measures the inset at its children instead.
+fn is_transparent_shell_for_flush(dom: &dyn Dom, child: ElId) -> bool {
+    let t = tag_lower(dom, child);
+    if matches!(
+        t.as_str(),
+        "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th"
+    ) {
+        return false;
+    }
+    let pos = dom.style(child, "position");
+    if pos == "fixed" || pos == "absolute" {
+        return false;
+    }
+    for key in ["overflow", "overflowX", "overflowY"] {
+        let v = js::to_lower_case(js::trim(&dom.style(child, key)));
+        if matches!(v.as_str(), "scroll" | "auto" | "hidden" | "clip") {
+            return false;
+        }
+    }
+    let bw = |k: &str| style_px(dom, child, k);
+    if bw("borderTopWidth") > 0.0
+        && !css_color_is_transparent(Some(&dom.style(child, "borderTopColor")))
+        || bw("borderRightWidth") > 0.0
+            && !css_color_is_transparent(Some(&dom.style(child, "borderRightColor")))
+        || bw("borderBottomWidth") > 0.0
+            && !css_color_is_transparent(Some(&dom.style(child, "borderBottomColor")))
+        || bw("borderLeftWidth") > 0.0
+            && !css_color_is_transparent(Some(&dom.style(child, "borderLeftColor")))
+    {
+        return false;
+    }
+    let ow = style_px(dom, child, "outlineWidth");
+    let os = dom.style(child, "outlineStyle");
+    let oc = dom.style(child, "outlineColor");
+    if ow > 0.0
+        && !css_color_is_transparent(Some(&oc))
+        && !os.is_empty()
+        && os != "none"
+    {
+        return false;
+    }
+    if has_visible_background_boundary(dom, child) {
+        return false;
+    }
+    if has_meaningful_direct_text(dom, child) {
+        return false;
+    }
+    !dom.children(child).is_empty()
+}
+
 /// Whether the fill `el` paints lies on a layer painting the same colour: a
 /// sibling laid earlier (so painted under it) that covers it, of `el` or of
 /// an ancestor below the first one that paints a background of its own.
@@ -1559,19 +1612,28 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                 const OVERFLOW_TOLERANCE: f64 = 1.0;
                 let mut children_overflow = [false; 4];
                 let mut children_insulate = [false; 4];
+                // #963: a single padding-free wrapper with no edge of its own
+                // renders where its children do. Measure the inset at its
+                // children instead (one level, up to 3 deep for nested shells).
+                // Overflow stays on the direct children: a grandchild box that
+                // moved past the edge still lands its text on the edge, while
+                // a direct child past the edge is clipped, not snug.
+                let mut effective: Vec<ElId> = children.clone();
+                for _ in 0..3 {
+                    if effective.len() != 1 {
+                        break;
+                    }
+                    let only = effective[0];
+                    if !is_transparent_shell_for_flush(dom, only) {
+                        break;
+                    }
+                    let inner = dom.children(only);
+                    if inner.is_empty() {
+                        break;
+                    }
+                    effective = inner;
+                }
                 for &child in &children {
-                    let child_pad = [
-                        len(child, "paddingTop"),
-                        len(child, "paddingRight"),
-                        len(child, "paddingBottom"),
-                        len(child, "paddingLeft"),
-                    ];
-                    let child_margin = [
-                        len(child, "marginTop"),
-                        len(child, "marginRight"),
-                        len(child, "marginBottom"),
-                        len(child, "marginLeft"),
-                    ];
                     let cr = dom.rect(child);
                     if cr.width > 0.0 && cr.height > 0.0 {
                         if rect.top - cr.top > OVERFLOW_TOLERANCE {
@@ -1586,6 +1648,23 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                         if rect.left - cr.left > OVERFLOW_TOLERANCE {
                             children_overflow[3] = true;
                         }
+                    }
+                }
+                for &child in &effective {
+                    let child_pad = [
+                        len(child, "paddingTop"),
+                        len(child, "paddingRight"),
+                        len(child, "paddingBottom"),
+                        len(child, "paddingLeft"),
+                    ];
+                    let child_margin = [
+                        len(child, "marginTop"),
+                        len(child, "marginRight"),
+                        len(child, "marginBottom"),
+                        len(child, "marginLeft"),
+                    ];
+                    let cr = dom.rect(child);
+                    if cr.width > 0.0 && cr.height > 0.0 {
                         if cr.top - rect.top >= CHILD_INSULATE_THRESHOLD {
                             children_insulate[0] = true;
                         }

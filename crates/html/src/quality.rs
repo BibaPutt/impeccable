@@ -390,14 +390,74 @@ const MARGIN_KEYS: [&str; 4] = ["marginTop", "marginRight", "marginBottom", "mar
 /// (`table` > `tbody` > `tr` > `td`).
 const MAX_INSULATE_DEPTH: usize = 4;
 
+const TABLEISH_TAGS: &[&str] = &["TABLE", "TBODY", "THEAD", "TFOOT", "TR", "TD", "TH"];
+
+fn is_transparent_wrapper_static(el: &StaticElement<'_>, style: &StyleValues) -> bool {
+    if has_visible_background_boundary(style, el) {
+        return false;
+    }
+    let tag = js::to_upper_case(&el.tag_lower());
+    if TABLEISH_TAGS.contains(&tag.as_str()) {
+        return false;
+    }
+    // A scroll/clip container is a boundary of its own: its children may be
+    // clipped, not inset. Only layout can clear those (pass-table-wrap).
+    for key in ["overflow", "overflowX", "overflowY"] {
+        let v = js::to_lower_case(js::trim(sv(style, key)));
+        if matches!(
+            v.as_str(),
+            "scroll" | "auto" | "hidden" | "clip"
+        ) {
+            return false;
+        }
+    }
+    let bw = |k: &str| pf0(sv(style, k));
+    let border_w = [
+        bw("borderTopWidth"),
+        bw("borderRightWidth"),
+        bw("borderBottomWidth"),
+        bw("borderLeftWidth"),
+    ];
+    let bc = |k: &str| {
+        let value = sv(style, k);
+        has_unresolved_var(value) || css_color_is_transparent(Some(value))
+    };
+    if (border_w[0] > 0.0 && !bc("borderTopColor"))
+        || (border_w[1] > 0.0 && !bc("borderRightColor"))
+        || (border_w[2] > 0.0 && !bc("borderBottomColor"))
+        || (border_w[3] > 0.0 && !bc("borderLeftColor"))
+    {
+        return false;
+    }
+    let outline_w = pf0(sv(style, "outlineWidth"));
+    let outline_style_val = sv(style, "outlineStyle");
+    let outline_color_val = sv(style, "outlineColor");
+    let outline_visible = outline_w > 0.0
+        && !has_unresolved_var(outline_color_val)
+        && !css_color_is_transparent(Some(outline_color_val))
+        && !outline_style_val.is_empty()
+        && !has_unresolved_var(outline_style_val)
+        && outline_style_val != "none";
+    if outline_visible {
+        return false;
+    }
+    true
+}
+
 /// Whether `el` keeps the container's text off side `s`.
 ///
 /// An element that holds one element and no text of its own is a pass-through
 /// (`<h3>` around a padded `<button>`, `<a>` around a padded card), so the
 /// question goes to what it wraps: the padding that insets the text often sits
 /// a step or two below the container's own child. Where it holds several
-/// children the question stops, because any one of them can reach the edge on
-/// its own and the padding of another says nothing about it. The browser rule
+/// children the question usually stops, because any one of them can reach the
+/// edge on its own and the padding of another says nothing about it. The one
+/// exception is a transparent page-shell wrapper (issue #963): a single
+/// padding-free `<div>` holding several padded sections (`header`/`main`/
+/// `footer`) insets every side at its children, has no boundary of its own,
+/// and renders the same as the sections sitting directly in the coloured
+/// wrapper. There every child must insulate the side; a branching table still
+/// stops the walk. The browser rule
 /// measures where the glyphs land and needs none of this; the static scan has
 /// no layout, so it reads the declarations that would move them.
 fn insulates_side(el: &StaticElement<'_>, s: usize, font_size: Option<f64>, depth: usize) -> bool {
@@ -417,7 +477,18 @@ fn insulates_side(el: &StaticElement<'_>, s: usize, font_size: Option<f64>, dept
     let children = el.children();
     match children.as_slice() {
         [only] => insulates_side(only, s, font_size, depth - 1),
-        _ => false,
+        _ => {
+            if children.is_empty() || depth == 0 {
+                return false;
+            }
+            // #963: transparent shell holding several padded sections.
+            if !is_transparent_wrapper_static(el, style) {
+                return false;
+            }
+            children
+                .iter()
+                .all(|c| insulates_side(c, s, font_size, depth - 1))
+        }
     }
 }
 
