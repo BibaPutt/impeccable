@@ -197,7 +197,8 @@ fn unwrap_css_at_layer_shapes() {
 }
 
 #[test]
-fn checks_shim_helpers() {    let mut props = CustomProps::new();
+fn checks_shim_helpers() {
+    let mut props = CustomProps::new();
     props.insert("--a".into(), "var(--b)".into());
     props.insert("--b".into(), "#fff".into());
     props.insert("--loop".into(), "var(--loop)".into());
@@ -243,4 +244,40 @@ fn bg_image_shorthand_resets_stale_color_964() {
         map.get("backgroundColor").unwrap().value,
         "rgba(0, 0, 0, 0)"
     );
+}
+
+/// A color after the image is a real surface (`url(photo.jpg) #111` paints
+/// the color beneath it), so no reset may fire. A var() confined to
+/// size/repeat territory (`center / var(--size)`) cannot name a color, so
+/// the stale color still resets; a var anywhere else blocks it.
+#[test]
+fn bg_shorthand_reset_keeps_trailing_color_and_size_vars() {
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+    let m3 = meta(false, [0, 3, 0], 2, false);
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1);
+    apply_static_declaration(&mut s, "n", "background", "url(photo.jpg) #111", &m2);
+    assert_eq!(s.get(&"n").unwrap().get("backgroundColor").unwrap().value, "#111");
+
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1);
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(photo.jpg) center / var(--size)",
+        &m2,
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "rgba(0, 0, 0, 0)"
+    );
+
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1);
+    apply_static_declaration(&mut s, "n", "background", "var(--bg) url(y.png)", &m3);
+    // The frozen expansion carries the var through as the color and the
+    // reset stays out of its way: it may resolve to a color later.
+    assert_eq!(s.get(&"n").unwrap().get("backgroundColor").unwrap().value, "var(--bg)");
 }

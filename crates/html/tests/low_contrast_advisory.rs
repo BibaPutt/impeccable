@@ -47,6 +47,28 @@ fn assert_failing(f: &Finding) {
     assert_eq!(f.advisory, None, "{f:#?}");
 }
 
+/// An explicit `background-color: transparent` on hover is a surface the
+/// author chose, even beside a hover image: with white text over #111 at
+/// rest and a transparent gradient hover on a white page, the hover state
+/// still reports white-on-white. Only an implied shorthand reset may be
+/// skipped there (issue #964).
+#[test]
+fn explicit_transparent_hover_with_image_still_reports() {
+    let findings = scan(
+        "<!DOCTYPE html><html><head><style>\
+         .hb { background: #111111; color: #ffffff; font-size: 16px; padding: 12px 16px; }\
+         .hb:hover { background-image: linear-gradient(transparent, transparent); background-color: transparent; }\
+         </style></head>\
+         <body style=\"background:#ffffff\"><div class=\"hb\">Cancel the trial now</div></body></html>",
+    );
+    let hover: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.snippet.contains(":hover state"))
+        .collect();
+    assert_eq!(hover.len(), 1, "{findings:#?}");
+    assert_failing(hover[0]);
+}
+
 #[test]
 fn near_bar_ratios_are_advisory_and_the_rest_fail() {
     let findings = scan_fixture("low-contrast-near-bar.html");

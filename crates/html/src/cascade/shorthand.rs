@@ -220,6 +220,43 @@ fn box4(names: [&str; 4], vals: [String; 4]) -> Vec<Expanded> {
     ]
 }
 
+static BG_FUNC_START_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:repeating-)?(?:linear|radial|conic)-gradient\s*\(|url\s*\(")
+        .expect("BG_FUNC_START_RE")
+});
+
+/// `value` with every `url(...)` and gradient function removed, parens
+/// balanced, so a color can be read wherever it sits outside them, before or
+/// after the image. Byte indexing is safe: every slice point is an ASCII
+/// paren or the end of the string.
+fn strip_background_image_functions(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(m) = BG_FUNC_START_RE.find(rest) {
+        out.push_str(&rest[..m.start()]);
+        let bytes = rest.as_bytes();
+        let mut depth = 0usize;
+        let mut idx = m.start();
+        while idx < bytes.len() {
+            match bytes[idx] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        idx += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+        rest = &rest[idx.min(rest.len())..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The `backgroundColor` reset a `background` shorthand with an image but no
 /// color implies (issue #964): `.hero { background: #111 }` then
 /// `.hero.photo { background: url(photo.jpg) center / cover }` paints
@@ -232,23 +269,30 @@ pub fn expand_background_color_reset(prop: &str, value: &str) -> Vec<Expanded> {
         return Vec::new();
     }
     let v = js::trim(value);
-    if v.is_empty() || VAR_ANYWHERE_RE.is_match(v) {
+    if v.is_empty() {
         return Vec::new();
     }
     let has_image = BG_IMAGE_RE.is_match(v);
     if !has_image {
         return Vec::new();
     }
-    let before_image: &str = match BG_IMAGE_SPLIT_RE.find(v) {
-        Some(m) => &v[..m.start()],
-        None => v,
-    };
-    if !extract_static_color(before_image).is_empty() {
+    // A color after the image is valid CSS (`url(photo.jpg) #111` paints the
+    // color beneath it), so read the whole value outside the image functions
+    // rather than only the part before the first one.
+    let remainder = strip_background_image_functions(v);
+    if !extract_static_color(&remainder).is_empty() {
         return Vec::new();
     }
-    // Also check full value for trailing color? Keep parity with expansion
-    // which only reads before_image; a color after the image is not a
-    // standard background-color position and stays unresolved.
+    // A var() may resolve to a color later, except in size/repeat territory:
+    // everything after the first '/' of the layer cannot name the surface
+    // (`center / var(--size)` with `--size: cover`), so only a var before
+    // any '/' blocks the reset.
+    if VAR_ANYWHERE_RE.is_match(&remainder) {
+        let head = remainder.split('/').next().unwrap_or("");
+        if VAR_ANYWHERE_RE.is_match(head) {
+            return Vec::new();
+        }
+    }
     vec![("backgroundColor".into(), "rgba(0, 0, 0, 0)".into())]
 }
 
