@@ -461,6 +461,30 @@ fn bg_shorthand_emits_var_span_not_plucked_color() {
     );
 }
 
+/// Several var()s in one layer: the stored color is the span that actually
+/// carries the color, not whichever var() comes first (a position var
+/// resolved as a color would read back as a non-color at compute).
+#[test]
+fn bg_shorthand_stores_the_var_that_is_the_color() {
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+    let layer_root = root(&[("--p", "50%"), ("--size", "cover"), ("--c", "blue")]);
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &layer_root);
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(photo.png) var(--p) / var(--size) var(--c)",
+        &m2,
+        &layer_root,
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "var(--c)"
+    );
+}
+
 /// A `)` inside an image function is part of the filename — quoted
 /// (`url("photo)red.png")`) or parser-escaped (`url(photo\)red.png)`) —
 /// never the function's end; mistaking one for a boundary reads `red` as

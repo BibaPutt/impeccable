@@ -392,13 +392,6 @@ fn without_var_spans(rem: &str) -> String {
     out
 }
 
-/// The first `var(...)` span in `rem`, else `None`.
-fn first_var_span(rem: &str) -> Option<&str> {
-    let m = VAR_ANYWHERE_RE.find(rem)?;
-    let end = var_span_end(rem.as_bytes(), m.end() - 1);
-    Some(&rem[m.start()..end.min(rem.len())])
-}
-
 /// Whether a `var()` sits where a color may be read: before the layer's
 /// first `/`, or with no `/` at all. After the slash only position/size
 /// tokens are legal — a var resolving to a color there makes the browser
@@ -406,6 +399,28 @@ fn first_var_span(rem: &str) -> Option<&str> {
 fn var_in_color_position(rem: &str) -> bool {
     let slash = rem.find('/').unwrap_or(rem.len());
     VAR_ANYWHERE_RE.find_iter(rem).any(|m| m.start() <= slash)
+}
+
+/// The var() span whose own resolved value reads as a color — the token
+/// that actually produced the layer's color. With several var()s in one
+/// layer the first is often a position or size, and storing that as
+/// `backgroundColor` would make compute resolve a non-color.
+fn color_var_span(
+    rem: &str,
+    root: &impeccable_core::checks::css_scan::CustomProps,
+) -> Option<String> {
+    let lookup = |name: &str| root.get(name).cloned();
+    let mut rest = rem;
+    while let Some(m) = VAR_ANYWHERE_RE.find(rest) {
+        let end = var_span_end(rest.as_bytes(), m.end() - 1).min(rest.len());
+        let span = &rest[m.start()..end];
+        let value = impeccable_core::checks::measures::resolve_var_refs(span, &lookup, 0);
+        if !extract_static_color(&value).is_empty() {
+            return Some(span.to_string());
+        }
+        rest = &rest[end..];
+    }
+    None
 }
 
 /// The `backgroundColor` a `background` shorthand with an image implies
@@ -491,10 +506,12 @@ pub fn expand_background_color_reset(
         if !literal.is_empty() {
             found = Some(literal);
         } else if var_in_color_position(&rem_v) {
-            let span = first_var_span(&rem_v)
-                .map(str::to_string)
-                .unwrap_or_else(|| color_r.clone());
-            found = Some(span);
+            match color_var_span(&rem_v, root) {
+                Some(span) => found = Some(span),
+                // No var() here carries a color after all; leave the
+                // cascade alone.
+                None => return Vec::new(),
+            }
         } else {
             // The color came out of a size slot — the browser drops such a
             // declaration rather than paint it.
