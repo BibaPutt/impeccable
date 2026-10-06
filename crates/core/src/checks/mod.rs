@@ -24,6 +24,9 @@
 //!   positionedStyleImpliesEscape, isOpaqueDecoratedBox. Open (value parsing,
 //!   lengths, alphas, shadows, the style traits and the input structs):
 //!   `impeccable_foundation::css::measures`.
+//! - `decorative_text`: the shapes of text with no reading job (avatar
+//!   initials, version stamps, signatures, mockup text) that report
+//!   `low-contrast` as advisory. The adapters gather the facts.
 //! - `text_rules`: the kicker / numbered-label / em-dash / repeated-text
 //!   gates: isKickerCandidate, isNumberedSectionLabelCandidate,
 //!   checkNumberedSectionLabels, checkEmDashOveruse, isRepeatedTextContainer.
@@ -32,6 +35,11 @@
 //! - `sampled_contrast`: the static engine's pixel-sampled verdict for text
 //!   over a `url()` background (#560): grid, decoration gate, wash and
 //!   compositing rules, the percentile verdict. No JS ancestor.
+//! - `text_context`: the contexts in which a typography finding reports as
+//!   advisory (framed HTML demos, legal fine print, micro-labels), decided
+//!   once over the `ContextNode` both engines implement.
+//! - `embedded_content`: how both engines read the controls and captions in
+//!   a box that frames embedded content for nested-cards (r4-p17).
 //!
 //! Element/document adapters (`checkElement*`, `*DOM`, `*FromDoc`) are NOT in
 //! core: the static ones live in the `html` crate against its DOM model, the
@@ -43,10 +51,14 @@
 //! `impeccable_foundation::vectors`.
 
 pub mod css_scan;
+pub mod decorative_text;
+pub mod embedded_content;
+pub mod gradient_geometry;
 pub mod html_patterns;
 pub mod measures;
 pub mod rules;
 pub mod sampled_contrast;
+pub mod text_context;
 pub mod text_rules;
 
 #[cfg(feature = "vectors")]

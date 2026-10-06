@@ -555,6 +555,7 @@ name = "impeccable-browser"
 version = "0.1.11"
 dependencies = [
  "base64",
+ "image",
  "impeccable-common",
  "impeccable-core",
  "impeccable-detect",
@@ -598,6 +599,7 @@ dependencies = [
 name = "impeccable-comp-verbs"
 version = "0.1.11"
 dependencies = [
+ "image",
  "impeccable-common",
  "impeccable-comp",
  "impeccable-context",

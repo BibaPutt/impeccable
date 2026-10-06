@@ -10,7 +10,7 @@
 //! paints, the wash and compositing rules, the percentile verdict and its
 //! label. Reading and decoding the image is the html crate's job.
 
-use crate::checks::rules::{safe_tag_unstyled, ColorOpts, RuleHit};
+use crate::checks::rules::{scores_safe_tag_text, ColorOpts, RuleHit};
 use crate::color::{color_to_hex, composite_color_over, contrast_ratio, Rgba};
 use crate::constants::{WCAG_LARGE_BOLD_TEXT_PX, WCAG_LARGE_TEXT_PX};
 use crate::js::{number_to_string, parse_float, to_fixed};
@@ -32,14 +32,17 @@ const MIN_TEXT_ALPHA: f64 = 0.1;
 
 /// The color rule's own gates plus the alpha floor, so the sampler never
 /// fires where `check_colors` would not have measured a resolved background.
+/// Bare text in a `SAFE_TAGS` element belongs to the deduped safe-tag path
+/// and is not sampled.
 pub fn applies(opts: &ColorOpts) -> bool {
     opts.has_direct_text
         && opts
             .text_color
             .is_some_and(|c| c.alpha_or_one() > MIN_TEXT_ALPHA)
         && !opts.is_emoji_only
+        && !opts.is_glyph_only
         && opts.bg_clip.as_deref() != Some("text")
-        && !safe_tag_unstyled(opts)
+        && !scores_safe_tag_text(opts)
 }
 
 /// The sample positions over a `width` x `height` raster: cell centers of
