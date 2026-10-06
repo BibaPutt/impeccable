@@ -485,6 +485,77 @@ fn bg_shorthand_stores_the_var_that_is_the_color() {
     );
 }
 
+/// A color may legally follow the size: `center / cover var(--bg)` paints
+/// `--bg` beneath the image, so the stored color is that var — not a veto
+/// just because the var sits past the slash.
+#[test]
+fn bg_shorthand_color_after_size_stores_the_var() {
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+    let layer_root = root(&[("--bg", "red")]);
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &layer_root);
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(photo.png) center / cover var(--bg)",
+        &m2,
+        &layer_root,
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "var(--bg)"
+    );
+}
+
+/// A var in the size slot itself (`center / var(--size)`) that resolves to
+/// a color: `center / red` is not a size, the browser drops the whole
+/// declaration, and the earlier rule's color must stand untouched.
+#[test]
+fn bg_shorthand_color_in_size_slot_keeps_prior_color() {
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+    let layer_root = root(&[("--size", "red")]);
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &layer_root);
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(photo.png) center / var(--size)",
+        &m2,
+        &layer_root,
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "#111"
+    );
+}
+
+/// Repeat var plus color var, no slash at all: the stored color is the
+/// var whose value is the color, not the repeat keyword that comes first.
+#[test]
+fn bg_shorthand_picks_color_var_past_repeat_var() {
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+    let layer_root = root(&[("--repeat", "no-repeat"), ("--red", "red")]);
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &layer_root);
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(photo.png) center var(--repeat) var(--red)",
+        &m2,
+        &layer_root,
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "var(--red)"
+    );
+}
+
 /// A `)` inside an image function is part of the filename — quoted
 /// (`url("photo)red.png")`) or parser-escaped (`url(photo\)red.png)`) —
 /// never the function's end; mistaking one for a boundary reads `red` as

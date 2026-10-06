@@ -392,35 +392,51 @@ fn without_var_spans(rem: &str) -> String {
     out
 }
 
-/// Whether a `var()` sits where a color may be read: before the layer's
-/// first `/`, or with no `/` at all. After the slash only position/size
-/// tokens are legal — a var resolving to a color there makes the browser
-/// drop the declaration instead of painting it.
-fn var_in_color_position(rem: &str) -> bool {
-    let slash = rem.find('/').unwrap_or(rem.len());
-    VAR_ANYWHERE_RE.find_iter(rem).any(|m| m.start() <= slash)
-}
-
 /// The var() span whose own resolved value reads as a color — the token
 /// that actually produced the layer's color. With several var()s in one
 /// layer the first is often a position or size, and storing that as
-/// `backgroundColor` would make compute resolve a non-color.
+/// `backgroundColor` would make compute resolve a non-color. Returns the
+/// span's start offset alongside it so callers can check its slot.
 fn color_var_span(
     rem: &str,
     root: &impeccable_core::checks::css_scan::CustomProps,
-) -> Option<String> {
+) -> Option<(usize, String)> {
     let lookup = |name: &str| root.get(name).cloned();
     let mut rest = rem;
+    let mut base = 0usize;
     while let Some(m) = VAR_ANYWHERE_RE.find(rest) {
         let end = var_span_end(rest.as_bytes(), m.end() - 1).min(rest.len());
         let span = &rest[m.start()..end];
         let value = impeccable_core::checks::measures::resolve_var_refs(span, &lookup, 0);
         if !extract_static_color(&value).is_empty() {
-            return Some(span.to_string());
+            return Some((base + m.start(), span.to_string()));
         }
+        base += end;
         rest = &rest[end..];
     }
     None
+}
+
+/// Whether the var() starting at `start` occupies the layer's size slot —
+/// right after the first `/`, with only whitespace before it. A color there
+/// (`center / red`) makes the browser drop the declaration rather than
+/// paint it.
+fn var_in_size_slot(rem: &str, start: usize) -> bool {
+    match rem.find('/') {
+        Some(slash) if start > slash => rem[slash + 1..start].trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether every var() in `rem` sits in the size slot (and a `/` exists at
+/// all). Such a layer's vars are sizes, never its surface.
+fn vars_only_in_size_slot(rem: &str) -> bool {
+    match rem.find('/') {
+        Some(slash) => VAR_ANYWHERE_RE
+            .find_iter(rem)
+            .all(|m| m.start() > slash && rem[slash + 1..m.start()].trim().is_empty()),
+        None => false,
+    }
 }
 
 /// The `backgroundColor` a `background` shorthand with an image implies
@@ -487,35 +503,33 @@ pub fn expand_background_color_reset(
         }
         // The layer holds var()s; none survive resolution (checked above).
         if color_r.is_empty() {
-            if var_in_color_position(&rem_v) {
-                // The element may scope a color here (`.hero { --bg: red }`
-                // over a stylesheet `--bg: cover`), and a leading var()
-                // already survives in the frozen expansion — keep what the
-                // cascade has.
-                return Vec::new();
+            if vars_only_in_size_slot(&rem_v) {
+                // A size-only var resolved to a non-color: the layer carries
+                // no surface, so the implied transparent stands.
+                continue;
             }
-            // A size-only var resolved to a non-color: the layer carries
-            // no surface, so the implied transparent stands.
-            continue;
+            // The element may scope a color here (`.hero { --bg: red }` over
+            // a stylesheet `--bg: cover`), and a leading var() already
+            // survives in the frozen expansion — keep what the cascade has.
+            return Vec::new();
         }
         // Store a color only in the spelling the author wrote: a literal
-        // outside the var()s, else the var() itself — never a token read
-        // from inside a custom-property name, and never the whole remainder
-        // when a var() leads it.
+        // outside the var()s, else the var() that actually carries the
+        // color — never a token read from inside a custom-property name,
+        // and never a position or size var that happens to come first.
         let literal = extract_static_color(&without_var_spans(&rem_v));
         if !literal.is_empty() {
             found = Some(literal);
-        } else if var_in_color_position(&rem_v) {
+        } else {
             match color_var_span(&rem_v, root) {
-                Some(span) => found = Some(span),
-                // No var() here carries a color after all; leave the
-                // cascade alone.
+                // A color in the size slot makes the browser drop the
+                // declaration rather than paint it; the prior rule stands.
+                Some((start, _)) if var_in_size_slot(&rem_v, start) => return Vec::new(),
+                Some((_, span)) => found = Some(span),
+                // No var() carries a color after all; leave the cascade
+                // alone rather than guess.
                 None => return Vec::new(),
             }
-        } else {
-            // The color came out of a size slot — the browser drops such a
-            // declaration rather than paint it.
-            return Vec::new();
         }
     }
     match found {
