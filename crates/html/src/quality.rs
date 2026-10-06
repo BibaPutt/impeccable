@@ -453,11 +453,14 @@ fn is_transparent_wrapper_static(el: &StaticElement<'_>, style: &StyleValues) ->
 /// children the question usually stops, because any one of them can reach the
 /// edge on its own and the padding of another says nothing about it. The one
 /// exception is a transparent page-shell wrapper (issue #963): a single
-/// padding-free `<div>` holding several padded sections (`header`/`main`/
+/// padding-free block holding several padded sections (`header`/`main`/
 /// `footer`) insets every side at its children, has no boundary of its own,
 /// and renders the same as the sections sitting directly in the coloured
-/// wrapper. There every child must insulate the side; a branching table still
-/// stops the walk. The browser rule
+/// wrapper. There every child must insulate the side. Anything laid out
+/// side by side instead of stacked (flex rows, grids, tables, inline runs,
+/// marquees) still stops the walk: without layout there is no telling which
+/// child reaches a side, so a padded sibling must never clear another
+/// child's flush text. The browser rule
 /// measures where the glyphs land and needs none of this; the static scan has
 /// no layout, so it reads the declarations that would move them.
 fn insulates_side(el: &StaticElement<'_>, s: usize, font_size: Option<f64>, depth: usize) -> bool {
@@ -483,6 +486,22 @@ fn insulates_side(el: &StaticElement<'_>, s: usize, font_size: Option<f64>, dept
             }
             // #963: transparent shell holding several padded sections.
             if !is_transparent_wrapper_static(el, style) {
+                return false;
+            }
+            // Only stacked block-level content: side-by-side children
+            // (flex rows, grids, inline runs, marquees) may each reach a
+            // different stretch of an edge, so their padding cannot speak
+            // for one another. A column flex stacks like blocks.
+            let display = js::to_lower_case(js::trim(sv(style, "display")));
+            let stacked = match display.as_str() {
+                "" | "block" | "flow-root" => true,
+                "flex" | "inline-flex" => {
+                    let dir = js::to_lower_case(js::trim(sv(style, "flexDirection")));
+                    matches!(dir.as_str(), "column" | "column-reverse")
+                }
+                _ => false,
+            };
+            if !stacked {
                 return false;
             }
             children
