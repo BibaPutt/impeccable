@@ -428,68 +428,24 @@ fn var_in_size_slot(rem: &str, start: usize) -> bool {
     }
 }
 
-/// Whether a bare token after the layer's slash could be part of a
-/// background size (a length, a percentage, or a size keyword).
-fn looks_like_bg_size(tok: &str) -> bool {
-    const UNITS: [&str; 15] = [
-        "px", "rem", "em", "ex", "ch", "vw", "vh", "vmin", "vmax", "cm", "mm", "in", "pt", "pc",
-        "q",
-    ];
-    if matches!(
-        tok,
-        "auto" | "cover" | "contain" | "min-content" | "max-content"
-    ) {
-        return true;
-    }
-    let t = tok.trim_start_matches('+').trim_start_matches('-');
-    if let Some(n) = t.strip_suffix('%') {
-        return n.parse::<f64>().is_ok();
-    }
-    UNITS
-        .iter()
-        .any(|u| t.strip_suffix(u).is_some_and(|n| n.parse::<f64>().is_ok()))
-}
-
-/// Whether every var() in `rem` sits within the layer's size — a size is
-/// one or two tokens after the `/`, so `center / var(--w) var(--h)` counts
-/// both, while a third token has left the size for the color region. No
-/// var may sit in the position slot before the slash. Such vars carry no
-/// surface of their own.
-fn vars_only_in_size_slot(rem: &str) -> bool {
+/// Whether every var() in `rem` sits after the layer's first `/` — the
+/// size region, where a non-color value carries no surface of its own, so
+/// the layer paints nothing under the image. A var before the slash (or a
+/// layer with no slash at all) may hold the layer's color — possibly
+/// scoped by the element rather than the stylesheet — and the cascade is
+/// left alone.
+fn vars_only_in_size_region(rem: &str) -> bool {
     let Some(slash) = rem.find('/') else {
         return false;
     };
-    if VAR_ANYWHERE_RE.find_iter(rem).any(|m| m.start() < slash) {
-        return false;
-    }
-    let after = &rem[slash + 1..];
-    let mut i = 0usize;
-    let mut tokens = 0usize;
-    while i < after.len() {
-        i += after[i..].len() - after[i..].trim_start().len();
-        if i >= after.len() {
-            break;
-        }
-        let rest = &after[i..];
-        let tok_end = match VAR_ANYWHERE_RE.find(rest) {
-            Some(m) if m.start() == 0 => {
-                var_span_end(after.as_bytes(), i + m.end() - 1).min(after.len())
-            }
-            _ => {
-                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-                if !looks_like_bg_size(&rest[..end]) {
-                    return false;
-                }
-                i + end
-            }
-        };
-        tokens += 1;
-        if tokens > 2 {
+    let mut any = false;
+    for m in VAR_ANYWHERE_RE.find_iter(rem) {
+        if m.start() < slash {
             return false;
         }
-        i = tok_end;
+        any = true;
     }
-    tokens > 0
+    any
 }
 
 /// The `backgroundColor` a `background` shorthand with an image implies
@@ -556,9 +512,10 @@ pub fn expand_background_color_reset(
         }
         // The layer holds var()s; none survive resolution (checked above).
         if color_r.is_empty() {
-            if vars_only_in_size_slot(&rem_v) {
-                // A size-only var resolved to a non-color: the layer carries
-                // no surface, so the implied transparent stands.
+            if vars_only_in_size_region(&rem_v) {
+                // Every var sits after the slash and resolves to a
+                // non-color: the layer carries no surface, so the implied
+                // transparent stands.
                 continue;
             }
             // The element may scope a color here (`.hero { --bg: red }` over

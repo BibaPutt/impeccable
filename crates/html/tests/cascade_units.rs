@@ -557,6 +557,29 @@ fn bg_shorthand_two_value_size_var_resets_to_transparent() {
     );
 }
 
+/// Trailing non-color keywords after the size (`no-repeat`, attachment)
+/// don't turn an image-only layer into a surface — the reset still fires.
+#[test]
+fn bg_shorthand_trailing_keywords_still_reset() {
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+    let layer_root = root(&[("--size", "cover")]);
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &layer_root);
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(photo.png) center / var(--size) no-repeat",
+        &m2,
+        &layer_root,
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "rgba(0, 0, 0, 0)"
+    );
+}
+
 /// Repeat var plus color var, no slash at all: the stored color is the
 /// var whose value is the color, not the repeat keyword that comes first.
 #[test]
