@@ -533,6 +533,30 @@ fn bg_shorthand_color_in_size_slot_keeps_prior_color() {
     );
 }
 
+/// A background size may be two values: `center / var(--w) var(--h)` is
+/// entirely size, so the image-only layer still implies transparent and
+/// must not keep the earlier color.
+#[test]
+fn bg_shorthand_two_value_size_var_resets_to_transparent() {
+    let m1 = meta(false, [0, 1, 0], 0, false);
+    let m2 = meta(false, [0, 2, 0], 1, false);
+    let layer_root = root(&[("--w", "100%"), ("--h", "auto")]);
+    let mut s: SpecifiedStore<&str> = SpecifiedStore::new();
+    apply_static_declaration(&mut s, "n", "background", "#111", &m1, &layer_root);
+    apply_static_declaration(
+        &mut s,
+        "n",
+        "background",
+        "url(photo.png) center / var(--w) var(--h)",
+        &m2,
+        &layer_root,
+    );
+    assert_eq!(
+        s.get(&"n").unwrap().get("backgroundColor").unwrap().value,
+        "rgba(0, 0, 0, 0)"
+    );
+}
+
 /// Repeat var plus color var, no slash at all: the stored color is the
 /// var whose value is the color, not the repeat keyword that comes first.
 #[test]

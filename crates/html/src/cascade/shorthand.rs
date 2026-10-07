@@ -428,15 +428,68 @@ fn var_in_size_slot(rem: &str, start: usize) -> bool {
     }
 }
 
-/// Whether every var() in `rem` sits in the size slot (and a `/` exists at
-/// all). Such a layer's vars are sizes, never its surface.
-fn vars_only_in_size_slot(rem: &str) -> bool {
-    match rem.find('/') {
-        Some(slash) => VAR_ANYWHERE_RE
-            .find_iter(rem)
-            .all(|m| m.start() > slash && rem[slash + 1..m.start()].trim().is_empty()),
-        None => false,
+/// Whether a bare token after the layer's slash could be part of a
+/// background size (a length, a percentage, or a size keyword).
+fn looks_like_bg_size(tok: &str) -> bool {
+    const UNITS: [&str; 15] = [
+        "px", "rem", "em", "ex", "ch", "vw", "vh", "vmin", "vmax", "cm", "mm", "in", "pt", "pc",
+        "q",
+    ];
+    if matches!(
+        tok,
+        "auto" | "cover" | "contain" | "min-content" | "max-content"
+    ) {
+        return true;
     }
+    let t = tok.trim_start_matches('+').trim_start_matches('-');
+    if let Some(n) = t.strip_suffix('%') {
+        return n.parse::<f64>().is_ok();
+    }
+    UNITS
+        .iter()
+        .any(|u| t.strip_suffix(u).is_some_and(|n| n.parse::<f64>().is_ok()))
+}
+
+/// Whether every var() in `rem` sits within the layer's size — a size is
+/// one or two tokens after the `/`, so `center / var(--w) var(--h)` counts
+/// both, while a third token has left the size for the color region. No
+/// var may sit in the position slot before the slash. Such vars carry no
+/// surface of their own.
+fn vars_only_in_size_slot(rem: &str) -> bool {
+    let Some(slash) = rem.find('/') else {
+        return false;
+    };
+    if VAR_ANYWHERE_RE.find_iter(rem).any(|m| m.start() < slash) {
+        return false;
+    }
+    let after = &rem[slash + 1..];
+    let mut i = 0usize;
+    let mut tokens = 0usize;
+    while i < after.len() {
+        i += after[i..].len() - after[i..].trim_start().len();
+        if i >= after.len() {
+            break;
+        }
+        let rest = &after[i..];
+        let tok_end = match VAR_ANYWHERE_RE.find(rest) {
+            Some(m) if m.start() == 0 => {
+                var_span_end(after.as_bytes(), i + m.end() - 1).min(after.len())
+            }
+            _ => {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                if !looks_like_bg_size(&rest[..end]) {
+                    return false;
+                }
+                i + end
+            }
+        };
+        tokens += 1;
+        if tokens > 2 {
+            return false;
+        }
+        i = tok_end;
+    }
+    tokens > 0
 }
 
 /// The `backgroundColor` a `background` shorthand with an image implies
