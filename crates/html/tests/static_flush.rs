@@ -150,6 +150,45 @@ fn the_canvas_follows_the_colour_scheme() {
     );
 }
 
+/// An absolutely positioned overlay's padding insets the overlay itself, not
+/// the parent's box: it can never speak for the parent's edges. The walk must
+/// stop at it, exactly like the browser rule does.
+#[test]
+fn a_positioned_shell_does_not_clear_the_walk() {
+    let html = page(
+        "body { margin: 0; }
+         .page { background: #123; padding: 0; border: 0; }
+         .rail { position: absolute; top: 0; left: 0; }
+         .rail p { margin: 0; padding: 24px; }",
+        "<div class=\"page\"><div class=\"rail\"><p>Rail one</p><p>Rail two</p></div></div>",
+    );
+    assert_eq!(
+        scan(&html),
+        vec!["<div> \"page\": children flush against bg on all sides (no inset)".to_string()]
+    );
+}
+
+/// A transparent shell does not stop margin collapse: the first and last
+/// vertical margins of its children collapse through it (and through a
+/// padding-free page) out of the coloured box, so the text touches the edge
+/// even though the declarations say 24px. Only padding (which never
+/// collapses) holds; horizontal margins never collapse either.
+#[test]
+fn margins_collapse_through_a_transparent_shell() {
+    let html = page(
+        "body { margin: 0; }
+         .page { background: #123; padding: 0; border: 0; }
+         .inner { padding: 0; margin: 0; }
+         .inner p { margin: 24px 0; padding: 0 24px; }",
+        "<div class=\"page\"><div class=\"inner\">\
+         <p>First paragraph of copy.</p><p>Second paragraph of copy.</p></div></div>",
+    );
+    assert_eq!(
+        scan(&html),
+        vec!["<div> \"page\": children flush against bg on top/bottom (no inset)".to_string()]
+    );
+}
+
 /// The fixture's two columns are the contract: a file scan must report every
 /// `flag-` case and nothing from the pass column. Layout is what clears the
 /// rest of the pass column, and a file scan has none, so the cases it cannot

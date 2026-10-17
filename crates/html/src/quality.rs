@@ -404,6 +404,13 @@ fn is_transparent_wrapper_static(el: &StaticElement<'_>, style: &StyleValues) ->
     if TABLEISH_TAGS.contains(&tag.as_str()) {
         return false;
     }
+    // An out-of-flow overlay's padding insets the overlay itself, not the
+    // parent's box, so it can never speak for the parent's edges (the
+    // browser rule rejects these positions too).
+    let pos = js::to_lower_case(js::trim(sv(style, "position")));
+    if matches!(pos.as_str(), "fixed" | "absolute") {
+        return false;
+    }
     // A scroll/clip container is a boundary of its own: its children may be
     // clipped, not inset. Only layout can clear those (pass-table-wrap).
     for key in ["overflow", "overflowX", "overflowY"] {
@@ -467,7 +474,21 @@ fn is_transparent_wrapper_static(el: &StaticElement<'_>, style: &StyleValues) ->
 /// child's flush text. The browser rule
 /// measures where the glyphs land and needs none of this; the static scan has
 /// no layout, so it reads the declarations that would move them.
-fn insulates_side(el: &StaticElement<'_>, s: usize, font_size: Option<f64>, depth: usize) -> bool {
+///
+/// `margins_count` is false for the children of a multi-child transparent
+/// shell on a vertical side: the shell has no padding or border of its own,
+/// so a child's top/bottom margin collapses through it (and through the
+/// padding-free parent the shell sits in) out of the coloured box, inseting
+/// nothing the reader can see. Horizontal margins never collapse and always
+/// count. Single-child pass-throughs keep the caller's flag: their margin
+/// behavior is the pre-#963 rule.
+fn insulates_side(
+    el: &StaticElement<'_>,
+    s: usize,
+    font_size: Option<f64>,
+    depth: usize,
+    margins_count: bool,
+) -> bool {
     const CHILD_INSULATE_THRESHOLD: f64 = 4.0;
     let style = el.style();
     // A side this engine cannot resolve (an unresolved var(), or an em or %
@@ -475,7 +496,7 @@ fn insulates_side(el: &StaticElement<'_>, s: usize, font_size: Option<f64>, dept
     let insulates = |key: &str| {
         side_len(style, key, font_size).is_none_or(|v| v >= CHILD_INSULATE_THRESHOLD)
     };
-    if insulates(PAD_KEYS[s]) || insulates(MARGIN_KEYS[s]) {
+    if insulates(PAD_KEYS[s]) || (margins_count && insulates(MARGIN_KEYS[s])) {
         return true;
     }
     if depth == 0 || el.has_direct_text_longer_than(4) {
@@ -483,7 +504,7 @@ fn insulates_side(el: &StaticElement<'_>, s: usize, font_size: Option<f64>, dept
     }
     let children = el.children();
     match children.as_slice() {
-        [only] => insulates_side(only, s, font_size, depth - 1),
+        [only] => insulates_side(only, s, font_size, depth - 1, margins_count),
         _ => {
             if children.is_empty() || depth == 0 {
                 return false;
@@ -508,9 +529,12 @@ fn insulates_side(el: &StaticElement<'_>, s: usize, font_size: Option<f64>, dept
             if !stacked {
                 return false;
             }
+            // Vertical margins collapse through this transparent shell;
+            // horizontal ones never do.
+            let child_margins = s == 1 || s == 3;
             children
                 .iter()
-                .all(|c| insulates_side(c, s, font_size, depth - 1))
+                .all(|c| insulates_side(c, s, font_size, depth - 1, child_margins))
         }
     }
 }
@@ -645,7 +669,7 @@ pub fn check_quality(q: &QualityInput<'_, '_>) -> Vec<RuleHit> {
                 for s in 0..4 {
                     children_insulate[s] = children
                         .iter()
-                        .any(|c| insulates_side(c, s, font_size, MAX_INSULATE_DEPTH));
+                        .any(|c| insulates_side(c, s, font_size, MAX_INSULATE_DEPTH, true));
                 }
                 let side_names = ["top", "right", "bottom", "left"];
                 let mut flush_sides: Vec<&str> = Vec::new();

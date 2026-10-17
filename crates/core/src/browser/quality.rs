@@ -2074,11 +2074,21 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                             ins[3] = true;
                         }
                     }
-                    for s in 0..4 {
-                        if child_pad[s] >= CHILD_INSULATE_THRESHOLD
-                            || child_margin[s] >= CHILD_INSULATE_THRESHOLD
-                        {
-                            ins[s] = true;
+                    // A relatively positioned child can cancel its own
+                    // declared padding with an offset (`padding-left: 24px;
+                    // left: -24px` lands the glyphs on the edge), and an
+                    // out-of-flow child's declarations describe its own box,
+                    // not this one. For those the measured rect above is the
+                    // whole answer; only statically laid out children earn
+                    // clearance from their declarations.
+                    let child_pos = js::to_lower_case(js::trim(&dom.style(child, "position")));
+                    if matches!(child_pos.as_str(), "" | "static") {
+                        for s in 0..4 {
+                            if child_pad[s] >= CHILD_INSULATE_THRESHOLD
+                                || child_margin[s] >= CHILD_INSULATE_THRESHOLD
+                            {
+                                ins[s] = true;
+                            }
                         }
                     }
                     for s in 0..4 {
@@ -3578,6 +3588,85 @@ mod tests {
         assert_eq!(
             hits[0].snippet,
             "<div> \"stack\": children flush against border on top/bottom (no inset)"
+        );
+    }
+
+    /// A relatively positioned child can cancel its own declared padding with
+    /// an offset: `padding-left: 24px; left: -24px` lands the glyphs on the
+    /// edge the padding claims to hold them off. The measured rect already
+    /// shows where the box went; the declarations of a positioned child say
+    /// nothing about that, so only the rect may clear the side.
+    #[test]
+    fn flush_ignores_padding_a_relative_offset_cancels() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let card = d.add(Some(body), "div");
+        d.set_attr(card, "class", "card");
+        d.set_rect(card, 0.0, 0.0, 600.0, 100.0);
+        d.set_styles(
+            card,
+            &[
+                ("position", "static"),
+                ("display", "block"),
+                ("borderTopWidth", "1px"),
+                ("borderRightWidth", "1px"),
+                ("borderBottomWidth", "1px"),
+                ("borderLeftWidth", "1px"),
+                ("borderTopColor", "rgb(200, 200, 200)"),
+                ("borderRightColor", "rgb(200, 200, 200)"),
+                ("borderBottomColor", "rgb(200, 200, 200)"),
+                ("borderLeftColor", "rgb(200, 200, 200)"),
+                ("outlineWidth", "0px"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                ("paddingTop", "0px"),
+                ("paddingRight", "0px"),
+                ("paddingBottom", "0px"),
+                ("paddingLeft", "0px"),
+                ("fontSize", "16px"),
+            ],
+        );
+        let shell = d.add(Some(card), "div");
+        d.set_rect(shell, 0.0, 0.0, 600.0, 100.0);
+        d.set_styles(
+            shell,
+            &[
+                ("display", "block"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                ("paddingTop", "0px"),
+                ("paddingRight", "0px"),
+                ("paddingBottom", "0px"),
+                ("paddingLeft", "0px"),
+                ("marginTop", "0px"),
+                ("marginRight", "0px"),
+                ("marginBottom", "0px"),
+                ("marginLeft", "0px"),
+                ("fontSize", "16px"),
+            ],
+        );
+        let p = text_el(&mut d, shell, "p", "Copy the offset pulled onto the rule", "16px");
+        // The padding would hold the glyphs 24px in; the relative offset
+        // moves the whole box 24px left, putting them on the card's edge.
+        d.set_styles(
+            p,
+            &[
+                ("position", "relative"),
+                ("paddingTop", "0px"),
+                ("paddingRight", "0px"),
+                ("paddingBottom", "0px"),
+                ("paddingLeft", "24px"),
+                ("marginTop", "0px"),
+                ("marginRight", "0px"),
+                ("marginBottom", "0px"),
+                ("marginLeft", "0px"),
+            ],
+        );
+        d.set_rect(p, -24.0, 0.0, 600.0, 100.0);
+        d.set_text_rect(p, 0.0, 20.0, 300.0, 18.0);
+        let hits = check_element_quality_dom(&d, card, &BrowserConfig::default());
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].snippet,
+            "<div> \"card\": children flush against border on left (no inset)"
         );
     }
 
