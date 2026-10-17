@@ -101,6 +101,31 @@ fn text_on_the_way_down_stops_the_walk() {
     );
 }
 
+/// Issue #963: a single padding-free wrapper holding several padded sections
+/// insets every side at its children and renders the same as the sections
+/// sitting directly in the coloured wrapper.
+#[test]
+fn transparent_shell_holding_padded_sections_does_not_flag() {
+    let style = "body { margin: 0; background: #eee; }
+         .page { background: #fff; }
+         header, main, footer { padding: 24px 32px; }";
+    let direct = page(
+        style,
+        "<div class=\"page\"><header><a href=\"#\">Home</a></header>\
+         <main><h1>Heading</h1><p>Body text.</p></main>\
+         <footer><p>Footer text.</p></footer></div>",
+    );
+    assert_eq!(scan(&direct), Vec::<String>::new());
+
+    let wrapped = page(
+        style,
+        "<div class=\"page\"><div class=\"inner\"><header><a href=\"#\">Home</a></header>\
+         <main><h1>Heading</h1><p>Body text.</p></main>\
+         <footer><p>Footer text.</p></footer></div></div>",
+    );
+    assert_eq!(scan(&wrapped), Vec::<String>::new());
+}
+
 /// White on an unpainted page is the canvas, not an edge; on a page that asks
 /// for a dark scheme the browser paints a dark canvas and the same card is a
 /// strong edge.
