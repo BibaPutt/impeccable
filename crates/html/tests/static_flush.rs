@@ -126,6 +126,26 @@ fn transparent_shell_holding_padded_sections_does_not_flag() {
     assert_eq!(scan(&wrapped), Vec::<String>::new());
 }
 
+/// Issue #963 scope: only a stacked, edgeless shell is seen through. A row
+/// flex shell lays its sections side by side, and a shell with a shadow is a
+/// card of its own; both stop the walk and the page still flags.
+#[test]
+fn row_or_shadowed_shells_are_not_seen_through() {
+    let body = "<div class=\"page\"><div class=\"inner\"><header><a href=\"#\">Home</a></header>\
+         <main><h1>Heading</h1><p>Body text.</p></main></div></div>";
+    let expect =
+        vec!["<div> \"page\": children flush against bg on all sides (no inset)".to_string()];
+    for inner in ["display: flex;", "box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);"] {
+        let style = format!(
+            "body {{ margin: 0; background: #eee; }}
+             .page {{ background: #fff; }}
+             .inner {{ {inner} }}
+             header, main {{ padding: 24px 32px; }}"
+        );
+        assert_eq!(scan(&page(&style, body)), expect, "{inner}");
+    }
+}
+
 /// White on an unpainted page is the canvas, not an edge; on a page that asks
 /// for a dark scheme the browser paints a dark canvas and the same card is a
 /// strong edge.
