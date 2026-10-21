@@ -2127,6 +2127,10 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                 // another whose text touches it).
                 let mut effective: Vec<ElId> = children.clone();
                 let mut unwrapped = false;
+                // A `flow-root` or a flex column holds its children's
+                // vertical margins inside; only plain block flow lets them
+                // collapse out of the shell.
+                let mut shells_stop_collapse = false;
                 for _ in 0..3 {
                     if effective.len() != 1 {
                         break;
@@ -2138,6 +2142,11 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                     let inner = dom.children(only);
                     if inner.is_empty() {
                         break;
+                    }
+                    let display =
+                        js::to_lower_case(js::trim(&dom.style(only, "display")));
+                    if !matches!(display.as_str(), "" | "block") {
+                        shells_stop_collapse = true;
                     }
                     effective = inner;
                     unwrapped = true;
@@ -2159,6 +2168,19 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                         }
                     }
                 }
+                // The measured glyphs settle a side: a declared padding a
+                // transform deeper down cancels (`padding: 32px` with a child
+                // carried 30px left) cannot clear text the browser sees on the
+                // boundary, and neither can a short label sitting on it.
+                let text_flush = text_descendants_flush_sides(dom, el, rect);
+                // A child's vertical margin only escapes the coloured box
+                // when no border, padding or clip on that side holds it there.
+                let clips = ["overflow", "overflowX", "overflowY"].iter().any(|key| {
+                    matches!(
+                        js::to_lower_case(js::trim(&dom.style(el, key))).as_str(),
+                        "hidden" | "scroll" | "auto"
+                    )
+                });
                 let mut eff_insulate: Vec<[bool; 4]> = Vec::with_capacity(effective.len());
                 for &child in &effective {
                     let mut ins = [false; 4];
@@ -2197,10 +2219,20 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                     // whole answer; only statically laid out children earn
                     // clearance from their declarations.
                     let child_pos = js::to_lower_case(js::trim(&dom.style(child, "position")));
+                    // Inside an unwrapped shell a vertical margin collapses
+                    // through it unless the shell or this box stops collapse;
+                    // there the rect already shows where the box went.
+                    let margin_counts = |s: usize| {
+                        !(unwrapped
+                            && (s == 0 || s == 2)
+                            && !shells_stop_collapse
+                            && !(border_visible[s] || pad[s] > 0.0 || clips))
+                    };
                     if matches!(child_pos.as_str(), "" | "static") {
                         for s in 0..4 {
                             if child_pad[s] >= CHILD_INSULATE_THRESHOLD
-                                || child_margin[s] >= CHILD_INSULATE_THRESHOLD
+                                || (margin_counts(s)
+                                    && child_margin[s] >= CHILD_INSULATE_THRESHOLD)
                             {
                                 ins[s] = true;
                             }
@@ -2219,13 +2251,12 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                 }
                 if unwrapped && !eff_insulate.is_empty() {
                     for s in 0..4 {
-                        if eff_insulate.iter().all(|ins| ins[s]) {
+                        if eff_insulate.iter().all(|ins| ins[s]) && !text_flush[s] {
                             children_insulate[s] = true;
                         }
                     }
                 }
 
-                let text_flush = text_descendants_flush_sides(dom, el, rect);
                 let full_bleed_bg_band = viewport_width > 0.0
                     && rect.width >= viewport_width * 0.94
                     && bg_visible
@@ -3914,6 +3945,175 @@ mod tests {
             hits[0].snippet,
             "<div> \"card\": children flush against border on left (no inset)"
         );
+    }
+
+    /// Issue #963's walk reads the padding of the sections behind a shell, but
+    /// a transform deeper down can carry their text back onto the rule: the
+    /// card is 1px from the glyphs even though the padded box declares 32px.
+    /// The measured glyphs have the last word.
+    #[test]
+    fn flush_reports_text_a_transform_carries_to_the_edge() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let card = d.add(Some(body), "div");
+        d.set_attr(card, "class", "card");
+        d.set_rect(card, 0.0, 0.0, 600.0, 100.0);
+        d.set_styles(
+            card,
+            &[
+                ("position", "static"),
+                ("display", "block"),
+                ("borderTopWidth", "1px"),
+                ("borderRightWidth", "1px"),
+                ("borderBottomWidth", "1px"),
+                ("borderLeftWidth", "1px"),
+                ("borderTopColor", "rgb(200, 200, 200)"),
+                ("borderRightColor", "rgb(200, 200, 200)"),
+                ("borderBottomColor", "rgb(200, 200, 200)"),
+                ("borderLeftColor", "rgb(200, 200, 200)"),
+                ("outlineWidth", "0px"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                ("paddingTop", "0px"),
+                ("paddingRight", "0px"),
+                ("paddingBottom", "0px"),
+                ("paddingLeft", "0px"),
+                ("fontSize", "16px"),
+            ],
+        );
+        let section = d.add(Some(card), "section");
+        d.set_rect(section, 0.0, 0.0, 600.0, 100.0);
+        d.set_styles(
+            section,
+            &[
+                ("display", "block"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                ("paddingTop", "0px"),
+                ("paddingRight", "0px"),
+                ("paddingBottom", "0px"),
+                ("paddingLeft", "0px"),
+                ("marginTop", "0px"),
+                ("marginRight", "0px"),
+                ("marginBottom", "0px"),
+                ("marginLeft", "0px"),
+                ("fontSize", "16px"),
+            ],
+        );
+        let pad = d.add(Some(section), "div");
+        d.set_attr(pad, "class", "pad");
+        d.set_rect(pad, 0.0, 0.0, 600.0, 100.0);
+        d.set_styles(
+            pad,
+            &[
+                ("display", "block"),
+                ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                ("paddingTop", "24px"),
+                ("paddingRight", "32px"),
+                ("paddingBottom", "24px"),
+                ("paddingLeft", "32px"),
+                ("marginTop", "0px"),
+                ("marginRight", "0px"),
+                ("marginBottom", "0px"),
+                ("marginLeft", "0px"),
+                ("fontSize", "16px"),
+            ],
+        );
+        let p = text_el(&mut d, pad, "p", "Shown copy a transform carried to the rule", "16px");
+        d.set_rect(p, 0.0, 24.0, 400.0, 24.0);
+        d.set_styles(
+            p,
+            &[
+                ("paddingTop", "0px"),
+                ("paddingRight", "0px"),
+                ("paddingBottom", "0px"),
+                ("paddingLeft", "0px"),
+                ("marginTop", "0px"),
+                ("marginRight", "0px"),
+                ("marginBottom", "0px"),
+                ("marginLeft", "0px"),
+            ],
+        );
+        // The padding would hold the glyphs 32px in; the shift puts them 2px
+        // from the card's left rule.
+        d.set_text_rect(p, 2.0, 24.0, 300.0, 18.0);
+        let hits = check_element_quality_dom(&d, card, &BrowserConfig::default());
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].snippet,
+            "<div> \"card\": children flush against border on left (no inset)"
+        );
+    }
+
+    /// A first child's top margin collapses through a plain block shell and
+    /// out of a page with no border, padding or clip, so the text lands on the
+    /// page's edge whatever the declaration says.
+    #[test]
+    fn flush_does_not_clear_a_margin_that_collapses_through_the_shell() {
+        let build = |display: &str| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let page = d.add(Some(body), "div");
+            d.set_attr(page, "class", "page");
+            d.set_rect(page, 0.0, 0.0, 600.0, 100.0);
+            d.set_styles(
+                page,
+                &[
+                    ("position", "static"),
+                    ("display", "block"),
+                    ("outlineWidth", "0px"),
+                    ("backgroundColor", "rgb(18, 52, 86)"),
+                    ("paddingTop", "0px"),
+                    ("paddingRight", "0px"),
+                    ("paddingBottom", "0px"),
+                    ("paddingLeft", "0px"),
+                    ("fontSize", "16px"),
+                ],
+            );
+            let shell = d.add(Some(page), "div");
+            d.set_rect(shell, 0.0, 0.0, 600.0, 100.0);
+            d.set_styles(
+                shell,
+                &[
+                    ("display", display),
+                    ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                    ("paddingTop", "0px"),
+                    ("paddingRight", "0px"),
+                    ("paddingBottom", "0px"),
+                    ("paddingLeft", "0px"),
+                    ("marginTop", "0px"),
+                    ("marginRight", "0px"),
+                    ("marginBottom", "0px"),
+                    ("marginLeft", "0px"),
+                    ("fontSize", "16px"),
+                ],
+            );
+            let p = text_el(&mut d, shell, "p", "Copy held by a margin that collapses away", "16px");
+            d.set_rect(p, 0.0, 0.0, 600.0, 100.0);
+            d.set_styles(
+                p,
+                &[
+                    ("paddingTop", "0px"),
+                    ("paddingRight", "0px"),
+                    ("paddingBottom", "0px"),
+                    ("paddingLeft", "24px"),
+                    ("marginTop", "24px"),
+                    ("marginRight", "0px"),
+                    ("marginBottom", "0px"),
+                    ("marginLeft", "0px"),
+                ],
+            );
+            // Collapsing flow puts the glyphs on the page's edge; a
+            // `flow-root` holds the margin, so they sit 24px down.
+            d.set_text_rect(p, 24.0, if display == "flow-root" { 25.0 } else { 1.0 }, 300.0, 18.0);
+            check_element_quality_dom(&d, page, &BrowserConfig::default())
+        };
+        let hits = build("block");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].snippet,
+            "<div> \"page\": children flush against bg on top (no inset)"
+        );
+        // A `flow-root` shell holds the margin inside, so the text is inset.
+        assert_eq!(build("flow-root"), Vec::new());
     }
 
     /// The accordion row every component library emits: `div.border` >

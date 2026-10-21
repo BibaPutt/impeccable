@@ -483,7 +483,11 @@ fn is_transparent_wrapper_static(el: &StaticElement<'_>, style: &StyleValues) ->
     if outline_visible {
         return false;
     }
-    true
+    // Text of the wrapper's own renders where the wrapper does, so a label
+    // short enough to slip the pass-through's length bar (`Sale`) still sits
+    // on the edge. Only a wrapper holding no text of its own can be seen
+    // through.
+    !has_nonblank_direct_text(el)
 }
 
 /// Whether `el` keeps the container's text off side `s`.
@@ -507,18 +511,21 @@ fn is_transparent_wrapper_static(el: &StaticElement<'_>, style: &StyleValues) ->
 /// no layout, so it reads the declarations that would move them.
 ///
 /// `margins_count` is false for the children of a multi-child transparent
-/// shell on a vertical side: the shell has no padding or border of its own,
-/// so a child's top/bottom margin collapses through it (and through the
-/// padding-free parent the shell sits in) out of the coloured box, inseting
-/// nothing the reader can see. Horizontal margins never collapse and always
-/// count. Single-child pass-throughs keep the caller's flag: their margin
-/// behavior is the pre-#963 rule.
+/// shell on a vertical side where the margin really collapses out of the
+/// coloured box: only a plain block shell inside a parent that does not stop
+/// collapse lets a child's top/bottom margin escape. A flex column, a
+/// `flow-root`, or a border, padding or clip on the parent holds the margin
+/// where the reader sees it, so there it still counts as inset.
+/// Horizontal margins never collapse and always count. Single-child
+/// pass-throughs keep the caller's flag: their margin behavior is the
+/// pre-#963 rule.
 fn insulates_side(
     el: &StaticElement<'_>,
     s: usize,
     font_size: Option<f64>,
     depth: usize,
     margins_count: bool,
+    outer_stops_collapse: bool,
 ) -> bool {
     const CHILD_INSULATE_THRESHOLD: f64 = 4.0;
     let style = el.style();
@@ -535,7 +542,14 @@ fn insulates_side(
     }
     let children = el.children();
     match children.as_slice() {
-        [only] => insulates_side(only, s, font_size, depth - 1, margins_count),
+        [only] => insulates_side(
+            only,
+            s,
+            font_size,
+            depth - 1,
+            margins_count,
+            outer_stops_collapse,
+        ),
         _ => {
             if children.is_empty() || depth == 0 {
                 return false;
@@ -560,12 +574,22 @@ fn insulates_side(
             if !stacked {
                 return false;
             }
-            // Vertical margins collapse through this transparent shell;
-            // horizontal ones never do.
-            let child_margins = s == 1 || s == 3;
-            children
-                .iter()
-                .all(|c| insulates_side(c, s, font_size, depth - 1, child_margins))
+            // Vertical margins collapse through a plain block shell and out
+            // of a parent with no border, padding or clip on that side;
+            // horizontal margins never do. A `flow-root` or a flex column
+            // holds the margins inside, so they inset the reader's view.
+            let shell_collapses = matches!(display.as_str(), "" | "block");
+            let child_margins = s == 1 || s == 3 || !shell_collapses || outer_stops_collapse;
+            children.iter().all(|c| {
+                insulates_side(
+                    c,
+                    s,
+                    font_size,
+                    depth - 1,
+                    child_margins,
+                    outer_stops_collapse,
+                )
+            })
         }
     }
 }
@@ -696,11 +720,22 @@ pub fn check_quality(q: &QualityInput<'_, '_>) -> Vec<RuleHit> {
                     side_len(style, "paddingLeft", font_size),
                 ];
                 const PAD_THRESHOLD: f64 = 2.0;
+                // A child's vertical margin only escapes the coloured box
+                // when nothing between them stops it: a border, any padding
+                // on the side, or a clip holds it where the reader sees it.
+                let clips = ["overflow", "overflowX", "overflowY"].iter().any(|key| {
+                    matches!(
+                        js::to_lower_case(js::trim(sv(style, key))).as_str(),
+                        "hidden" | "scroll" | "auto"
+                    )
+                });
                 let mut children_insulate = [false; 4];
                 for s in 0..4 {
-                    children_insulate[s] = children
-                        .iter()
-                        .any(|c| insulates_side(c, s, font_size, MAX_INSULATE_DEPTH, true));
+                    let stops_collapse =
+                        border_visible[s] || pad[s].is_some_and(|v| v > 0.0) || clips;
+                    children_insulate[s] = children.iter().any(|c| {
+                        insulates_side(c, s, font_size, MAX_INSULATE_DEPTH, true, stops_collapse)
+                    });
                 }
                 let side_names = ["top", "right", "bottom", "left"];
                 let mut flush_sides: Vec<&str> = Vec::new();

@@ -209,6 +209,73 @@ fn margins_collapse_through_a_transparent_shell() {
     );
 }
 
+/// A `flow-root` shell holds its children's vertical margins inside its own
+/// box, so they really do inset the coloured page; only plain block flow lets
+/// them collapse out.
+#[test]
+fn a_flow_root_shell_keeps_margin_clearance() {
+    let html = page(
+        "body { margin: 0; }
+         .page { background: #123; padding: 0; border: 0; }
+         .inner { display: flow-root; padding: 0; margin: 0; }
+         .inner p { margin: 24px 0; padding: 0 24px; }",
+        "<div class=\"page\"><div class=\"inner\">\
+         <p>First paragraph of copy.</p><p>Second paragraph of copy.</p></div></div>",
+    );
+    assert_eq!(scan(&html), Vec::<String>::new());
+}
+
+/// A flex column stacks like a block but its items' margins never collapse,
+/// so the same declarations are visible air between the text and the edge.
+#[test]
+fn a_column_flex_shell_keeps_margin_clearance() {
+    let html = page(
+        "body { margin: 0; }
+         .page { background: #123; padding: 0; border: 0; }
+         .inner { display: flex; flex-direction: column; padding: 0; margin: 0; }
+         .inner p { margin: 24px 0; padding: 0 24px; }",
+        "<div class=\"page\"><div class=\"inner\">\
+         <p>First paragraph of copy.</p><p>Second paragraph of copy.</p></div></div>",
+    );
+    assert_eq!(scan(&html), Vec::<String>::new());
+}
+
+/// A border on the coloured box stops the collapse at the box, so the margin
+/// keeps the text off the rule even though the shell in between is plain
+/// block.
+#[test]
+fn a_border_on_the_coloured_box_keeps_margin_clearance() {
+    let html = page(
+        "body { margin: 0; }
+         .page { background: #123; padding: 0; border: 1px solid #123; }
+         .inner { padding: 0; margin: 0; }
+         .inner p { margin: 24px 0; padding: 0 24px; }",
+        "<div class=\"page\"><div class=\"inner\">\
+         <p>First paragraph of copy.</p><p>Second paragraph of copy.</p></div></div>",
+    );
+    assert_eq!(scan(&html), Vec::<String>::new());
+}
+
+/// The text of the wrapper itself renders where the wrapper does. A label
+/// short enough to slip the pass-through's length bar (`Sale`) still sits on
+/// the page's edge, so the shell is not seen through.
+#[test]
+fn a_short_label_in_the_shell_keeps_the_warning() {
+    let html = page(
+        "body { margin: 0; }
+         .page { background: #123; padding: 0; border: 0; }
+         .inner { padding: 0; margin: 0; }
+         .inner section { padding: 24px 32px; }",
+        "<div class=\"page\"><div class=\"inner\">Sale\
+         <section><p>First block of copy.</p></section>\
+         <section><p>Second block of copy.</p></section></div></div>",
+    );
+    assert_eq!(
+        scan(&html),
+        vec!["<div> \"page\": children flush against bg on all sides (no inset)".to_string()]
+    );
+}
+
 /// The fixture's two columns are the contract: a file scan must report every
 /// `flag-` case and nothing from the pass column. Layout is what clears the
 /// rest of the pass column, and a file scan has none, so the cases it cannot
