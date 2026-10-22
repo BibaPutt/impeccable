@@ -44,7 +44,7 @@ fn the_shell_fixture_reports_exactly_its_flag_column() {
     flagged.dedup();
     assert_eq!(
         flagged,
-        vec!["#flag-shell-margins-escape", "#flag-shell-offset-left", "#flag-shell-offset-top"],
+        vec!["#flag-shell-margins-escape", "#flag-shell-offset-left", "#flag-shell-offset-top", "#flag-shell-transform"],
         "{findings:#?}"
     );
 }

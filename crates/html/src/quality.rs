@@ -439,12 +439,16 @@ const MAX_INSULATE_DEPTH: usize = 4;
 
 const TABLEISH_TAGS: &[&str] = &["TABLE", "TBODY", "THEAD", "TFOOT", "TR", "TD", "TH"];
 
-/// Whether a relative or sticky offset moves `style`'s box off where the
+/// Whether a transform, or a relative or sticky offset, moves `style`'s box off where the
 /// layout put it. Its children's declared padding then says nothing about
 /// where their text lands (`left: -24px` over `padding: 24px` puts it on the
 /// rule), so the walk cannot read clearance through it. An offset this
 /// engine cannot resolve may move the box, so it counts.
 fn is_offset_static(style: &StyleValues) -> bool {
+    let transform = js::to_lower_case(js::trim(sv(style, "transform")));
+    if !transform.is_empty() && transform != "none" {
+        return true;
+    }
     let pos = js::to_lower_case(js::trim(sv(style, "position")));
     if !matches!(pos.as_str(), "relative" | "sticky") {
         return false;
@@ -460,11 +464,15 @@ fn is_offset_static(style: &StyleValues) -> bool {
 
 /// Whether `style`'s box keeps its children's vertical margins inside it: a
 /// flex or grid container (its items' margins never collapse with it), a
-/// `flow-root` or any other display that starts a new formatting context.
-/// Only plain block flow lets a child's margin collapse through.
+/// `flow-root` or any other display that starts a new formatting context,
+/// or a float. Only plain block flow lets a child's margin collapse through.
 fn holds_child_margins_static(style: &StyleValues) -> bool {
     let display = js::to_lower_case(js::trim(sv(style, "display")));
-    !matches!(display.as_str(), "" | "block" | "list-item")
+    if !matches!(display.as_str(), "" | "block" | "list-item") {
+        return true;
+    }
+    let float = js::to_lower_case(js::trim(sv(style, "float")));
+    !float.is_empty() && float != "none"
 }
 
 fn is_transparent_wrapper_static(el: &StaticElement<'_>, style: &StyleValues) -> bool {

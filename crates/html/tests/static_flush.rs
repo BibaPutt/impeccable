@@ -360,6 +360,7 @@ fn the_shell_fixture_reports_exactly_its_flag_column() {
             "flag-shell-margins-escape".to_string(),
             "flag-shell-offset-left".to_string(),
             "flag-shell-offset-top".to_string(),
+            "flag-shell-transform".to_string(),
         ]
     );
 }

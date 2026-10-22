@@ -13,12 +13,14 @@
        paragraphs carry the inset, and the question is whether it reaches the
        reader:
 
-       - A relative offset on the shell moves the paragraphs with it, so a
-         shell carried 24px left lands 24px-padded text on the left rule.
+       - A relative offset or a transform on the shell moves the paragraphs
+         with it, so a shell carried 24px left lands 24px-padded text on the
+         left rule.
        - A border of any colour on the card, a transparent one included,
          stops the paragraphs' vertical margins from collapsing out of it.
-       - A card that is a flex or grid container, or a flow-root, holds its
-         children's vertical margins inside, so they inset the text.
+       - A card that is a flex or grid container, a flow-root or a float
+         holds its children's vertical margins inside, so they inset the
+         text.
 
        crates/html/tests/static_flush.rs and crates/browser/tests/
        transparent_shell.rs both read this file: every flag- card must be
@@ -45,6 +47,9 @@
     .flex-card { display: flex; flex-direction: column; }
     .grid-card { display: grid; }
     .flow-root-card { display: flow-root; }
+    .shift-transform { transform: translateX(-24px); }
+    .float-case { display: flow-root; }
+    .float-card { float: left; }
   </style>
 </head>
 <body>
@@ -65,6 +70,14 @@
         <span class="case-label">the shell is carried 24px up, so the first paragraph's padding sits above the card.</span>
         <div class="flag-shell-offset-top card ruled padded" id="flag-shell-offset-top">
           <div class="shell shift-up"><p>Copy a relative offset lifted onto the rule.</p><p>A second paragraph below it.</p></div>
+        </div>
+      </div>
+
+      <h3>Shell carried by a transform</h3>
+      <div class="case">
+        <span class="case-label">a translateX(-24px) on the shell carries the padded paragraphs onto the card's left rule.</span>
+        <div class="flag-shell-transform card ruled padded" id="flag-shell-transform">
+          <div class="shell shift-transform"><p>Copy a transform carried onto the rule.</p><p>A second paragraph beside it.</p></div>
         </div>
       </div>
 
@@ -117,6 +130,14 @@
         <span class="case-label">the card is a flow-root: it contains its children's margins.</span>
         <div class="pass-shell-flow-root-card card spaced flow-root-card" id="pass-shell-flow-root-card">
           <div class="shell"><p>Copy in a flow-root card.</p><p>A second paragraph below it.</p></div>
+        </div>
+      </div>
+
+      <h3>Floated card holds the margins</h3>
+      <div class="case float-case">
+        <span class="case-label">the card is floated, which starts a formatting context that contains its children's margins.</span>
+        <div class="pass-shell-float-card card spaced float-card" id="pass-shell-float-card">
+          <div class="shell"><p>Copy in a floated card.</p><p>A second paragraph below it.</p></div>
         </div>
       </div>
     </div>
