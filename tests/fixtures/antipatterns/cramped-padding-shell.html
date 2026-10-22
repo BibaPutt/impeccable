@@ -57,6 +57,7 @@
     .shift-each p { position: relative; left: -24px; }
     .float-shell { float: left; width: 480px; }
     .pull-each p { margin-left: -24px; }
+    .nudge-each p { margin-left: -1px; }
     .pinned { position: relative; height: 160px; }
     .pinned .shell p + p { position: absolute; left: -24px; top: 72px; }
     .card > .loose { margin: 0; padding: 0; }
@@ -173,6 +174,14 @@
         <span class="case-label">the second paragraph is absolutely pinned; its own offsets place it, not the shell (like a badge on a card corner), so the in-flow paragraph decides.</span>
         <div class="pass-shell-pinned-label card ruled padded pinned" id="pass-shell-pinned-label">
           <div class="shell"><p>Copy in normal flow, padded off the rule.</p><p>Pinned label copy.</p></div>
+        </div>
+      </div>
+
+      <h3>Paragraphs nudged by a small negative margin</h3>
+      <div class="case">
+        <span class="case-label">margin-left: -1px against 24px of padding still leaves the text 23px off the rule.</span>
+        <div class="pass-shell-slight-pull card ruled padded nudge-each" id="pass-shell-slight-pull">
+          <div class="shell"><p>Copy nudged a pixel, still well inset.</p><p>A second paragraph below it.</p></div>
         </div>
       </div>
 

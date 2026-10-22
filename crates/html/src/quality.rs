@@ -661,8 +661,15 @@ fn insulates_side(
             !in_flow.is_empty()
                 && in_flow.iter().all(|c| {
                     let cs = c.style();
+                    // A negative margin only cancels clearance when it eats
+                    // the padding down past the threshold.
+                    let pulled = js::trim(sv(cs, MARGIN_KEYS[s])).starts_with('-')
+                        && !matches!(
+                            (side_len(cs, PAD_KEYS[s], font_size), side_len(cs, MARGIN_KEYS[s], font_size)),
+                            (Some(pad), Some(margin)) if pad + margin >= 4.0
+                        );
                     !is_offset_static(cs)
-                        && !js::trim(sv(cs, MARGIN_KEYS[s])).starts_with('-')
+                        && !pulled
                         && insulates_side(c, s, font_size, depth - 1, child_margins, stops_below, true)
                 })
         }
