@@ -336,3 +336,30 @@ fn the_flush_fixture_reports_its_flag_column() {
         "file scan lost flag cases: {flagged:?}"
     );
 }
+
+/// `cramped-padding-shell.html` (PR #1059): a shell's relative offset carries
+/// its padded children onto the rule, and a border of any colour or a card
+/// that is a flex, grid or flow-root container holds the children's margins
+/// inside. The file scan reads all of it from the declarations, so the two
+/// columns hold exactly.
+#[test]
+fn the_shell_fixture_reports_exactly_its_flag_column() {
+    let Some(path) = fixture("cramped-padding-shell.html") else {
+        eprintln!("fixture not found; skipping");
+        return;
+    };
+    let src = std::fs::read_to_string(&path).unwrap();
+    let mut flagged: Vec<String> = scan(&src)
+        .iter()
+        .map(|snippet| snippet.split('"').nth(1).unwrap_or_default().to_string())
+        .collect();
+    flagged.sort();
+    assert_eq!(
+        flagged,
+        vec![
+            "flag-shell-margins-escape".to_string(),
+            "flag-shell-offset-left".to_string(),
+            "flag-shell-offset-top".to_string(),
+        ]
+    );
+}

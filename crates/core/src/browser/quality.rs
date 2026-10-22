@@ -140,17 +140,17 @@ fn is_button_box(dom: &dyn Dom, el: ElId) -> bool {
     false
 }
 const FURNITURE_ELEMENTS: &str = "nav, [role=\"navigation\"], td, th, [role=\"gridcell\"], [role=\"cell\"], caption, figcaption, dt, dd, footer";
-const FURNITURE_CLASSES: &str = "[class*=\"meta\" i], [class*=\"label\" i], [class*=\"badge\" i], [class*=\"chip\" i], [class*=\"pill\" i], [class*=\"tag\" i], [class*=\"kicker\" i], [class*=\"eyebrow\" i], [class*=\"breadcrumb\" i], [class*=\"timestamp\" i], [class*=\"category\" i], [class*=\"caption\" i], [class*=\"nav\" i]";
 
 /// Whether `el` is, or sits in, page furniture: navigation, a table cell, a
 /// caption, a footer, or a box whose class names one (a label, a chip, a
-/// breadcrumb). The class markers are not read off `html`, which holds the
+/// breadcrumb), read by part ([`class_names_furniture`]). The class markers are not read off `html`, which holds the
 /// page's script state flags: schlittermann.de's `html.js-nav-ready` made
 /// every element on the page navigation, a 10px sentence among them.
 /// `body` is still read: letour.fr's `body.has-breadcrumb` is a state flag
 /// too, but the 10px team names it reaches in the ranking rows are ones both
 /// judges called harmful (run 35, 218586).
 fn is_furniture(dom: &dyn Dom, el: ElId) -> bool {
+    use crate::checks::decorative_text::class_names_furniture;
     if matches_or_closest(dom, el, FURNITURE_ELEMENTS) {
         return true;
     }
@@ -159,7 +159,7 @@ fn is_furniture(dom: &dyn Dom, el: ElId) -> bool {
         if tag_lower(dom, c) == "html" {
             return false;
         }
-        if matches_or_false(dom, c, FURNITURE_CLASSES) {
+        if dom.attr(c, "class").is_some_and(|cls| class_names_furniture(&cls)) {
             return true;
         }
         cur = dom.parent(c);
@@ -352,6 +352,38 @@ fn raster_covers(dom: &dyn Dom, layer: ElId, r: &Rect) -> bool {
 /// table part, not positioned, not a scroll/clip container, and its children
 /// stack (block flow or a column flex). Its children render where its own box
 /// does, so the flush rule measures the inset at its children instead.
+/// Whether a relative or sticky offset, or a transform, moves `e`'s box off
+/// where the layout put it. A shell carried past the edge that way is not
+/// content running out of the box: its padded children ride along, and the
+/// measured text is what says where their glyphs land.
+fn is_offset_box(dom: &dyn Dom, e: ElId) -> bool {
+    let transform = js::to_lower_case(js::trim(&dom.style(e, "transform")));
+    if !transform.is_empty() && transform != "none" {
+        return true;
+    }
+    let pos = js::to_lower_case(js::trim(&dom.style(e, "position")));
+    if !matches!(pos.as_str(), "relative" | "sticky") {
+        return false;
+    }
+    ["top", "right", "bottom", "left"].iter().any(|k| {
+        let v = js::to_lower_case(js::trim(&dom.style(e, k)));
+        !v.is_empty() && v != "auto" && parse_float(&v) != 0.0
+    })
+}
+
+/// Whether `e` keeps its children's vertical margins inside it: a flex or
+/// grid container, a `flow-root` or any other display that starts a
+/// formatting context, or a float. Only plain block flow lets them collapse
+/// through.
+fn holds_child_margins(dom: &dyn Dom, e: ElId) -> bool {
+    let display = js::to_lower_case(js::trim(&dom.style(e, "display")));
+    if !matches!(display.as_str(), "" | "block" | "list-item") {
+        return true;
+    }
+    let float = js::to_lower_case(js::trim(&dom.style(e, "cssFloat")));
+    !float.is_empty() && float != "none"
+}
+
 fn is_transparent_shell_for_flush(dom: &dyn Dom, child: ElId) -> bool {
     let t = tag_lower(dom, child);
     if matches!(
@@ -2151,7 +2183,8 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                 // A `flow-root` or a flex column holds its children's
                 // vertical margins inside; only plain block flow lets them
                 // collapse out of the shell.
-                let mut shells_stop_collapse = false;
+                // So does a border of any colour on a shell's side.
+                let mut shells_stop_collapse = [holds_child_margins(dom, el); 4];
                 for _ in 0..3 {
                     if effective.len() != 1 {
                         break;
@@ -2164,15 +2197,21 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                     if inner.is_empty() {
                         break;
                     }
-                    let display =
-                        js::to_lower_case(js::trim(&dom.style(only, "display")));
-                    if !matches!(display.as_str(), "" | "block") {
-                        shells_stop_collapse = true;
+                    let held = holds_child_margins(dom, only);
+                    for (s, side) in ["Top", "Right", "Bottom", "Left"].iter().enumerate() {
+                        if held || style_px(dom, only, &format!("border{side}Width")) > 0.0 {
+                            shells_stop_collapse[s] = true;
+                        }
                     }
                     effective = inner;
                     unwrapped = true;
                 }
                 for &child in &children {
+                    // A shell an offset carried past the edge is not content
+                    // running out of the box; the measured text decides.
+                    if unwrapped && is_offset_box(dom, child) {
+                        continue;
+                    }
                     let cr = dom.rect(child);
                     if cr.width > 0.0 && cr.height > 0.0 {
                         if rect.top - cr.top > OVERFLOW_TOLERANCE {
@@ -2246,8 +2285,8 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                     let margin_counts = |s: usize| {
                         !(unwrapped
                             && (s == 0 || s == 2)
-                            && !shells_stop_collapse
-                            && !(border_visible[s] || pad[s] > 0.0 || clips))
+                            && !shells_stop_collapse[s]
+                            && !(border_w[s] > 0.0 || pad[s] > 0.0 || clips))
                     };
                     if matches!(child_pos.as_str(), "" | "static") {
                         for s in 0..4 {
@@ -3335,13 +3374,13 @@ mod tests {
         };
         let mut d = FakeDom::new();
         let (html, body) = d.with_page();
-        d.add_selector(html, FURNITURE_CLASSES);
+        d.set_attr(html, "class", "js js-nav-ready");
         let note = text_el(&mut d, body, "p", "For mails we never asked for and will never read", "10px");
         d.set_rect(note, 40.0, 400.0, 600.0, 14.0);
         assert!(!undersized(&d, note), "a sentence under html.js-nav-ready");
         // A box inside the page whose class names navigation still counts.
         let nav = d.add(Some(body), "div");
-        d.add_selector(nav, FURNITURE_CLASSES);
+        d.set_attr(nav, "class", "site-nav");
         let item = text_el(&mut d, nav, "span", "Linux support and consulting since 1997", "10px");
         d.set_rect(item, 40.0, 500.0, 300.0, 14.0);
         assert!(undersized(&d, item));

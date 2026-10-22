@@ -390,11 +390,28 @@ fn is_button_label(el: &StaticElement<'_>) -> bool {
     false
 }
 const FURNITURE_ELEMENTS: &str = "nav, [role=\"navigation\"], td, th, [role=\"gridcell\"], [role=\"cell\"], caption, figcaption, dt, dd, footer";
-/// Class markers of page furniture. As in the browser engine, they are not
-/// read off `html`, which holds a page's script state flags
-/// (`html.js-nav-ready` is not navigation).
-const FURNITURE_CLASSES: &str = "[class*=\"meta\" i], [class*=\"label\" i], [class*=\"badge\" i], [class*=\"chip\" i], [class*=\"pill\" i], [class*=\"tag\" i], [class*=\"kicker\" i], [class*=\"eyebrow\" i], [class*=\"breadcrumb\" i], [class*=\"timestamp\" i], [class*=\"category\" i], [class*=\"caption\" i], [class*=\"nav\" i]";
 const SMALLPRINT: &str = "small, footer, [class*=\"legal\" i], [class*=\"copyright\" i], [class*=\"fineprint\" i], [class*=\"fine-print\" i], [class*=\"smallprint\" i], [class*=\"small-print\" i], [class*=\"disclaimer\" i], [class*=\"disclosure\" i], [class*=\"footnote\" i]";
+
+/// Whether `el` or a box around it carries a class that names page
+/// furniture, read by part as the browser engine does
+/// (`impeccable_core::checks::decorative_text::class_names_furniture`). The
+/// markers are not read off `html`, which holds a page's script state flags
+/// (`html.js-nav-ready` is not navigation).
+fn has_furniture_class(el: StaticElement<'_>) -> bool {
+    let mut cur = Some(el);
+    while let Some(c) = cur {
+        if c.tag_lower() == "html" {
+            return false;
+        }
+        if c.get_attribute("class").is_some_and(|cls| {
+            impeccable_core::checks::decorative_text::class_names_furniture(cls)
+        }) {
+            return true;
+        }
+        cur = c.parent_element();
+    }
+    false
+}
 
 fn has_unresolved_var(value: &str) -> bool {
     js::to_lower_case(value).contains("var(")
@@ -421,6 +438,34 @@ const MARGIN_KEYS: [&str; 4] = ["marginTop", "marginRight", "marginBottom", "mar
 const MAX_INSULATE_DEPTH: usize = 4;
 
 const TABLEISH_TAGS: &[&str] = &["TABLE", "TBODY", "THEAD", "TFOOT", "TR", "TD", "TH"];
+
+/// Whether a relative or sticky offset moves `style`'s box off where the
+/// layout put it. Its children's declared padding then says nothing about
+/// where their text lands (`left: -24px` over `padding: 24px` puts it on the
+/// rule), so the walk cannot read clearance through it. An offset this
+/// engine cannot resolve may move the box, so it counts.
+fn is_offset_static(style: &StyleValues) -> bool {
+    let pos = js::to_lower_case(js::trim(sv(style, "position")));
+    if !matches!(pos.as_str(), "relative" | "sticky") {
+        return false;
+    }
+    ["top", "right", "bottom", "left"].iter().any(|k| {
+        let v = js::to_lower_case(js::trim(sv(style, k)));
+        if v.is_empty() || v == "auto" {
+            return false;
+        }
+        has_unresolved_var(&v) || resolve_length_px(Some(&v), 16.0).is_none_or(|px| px != 0.0)
+    })
+}
+
+/// Whether `style`'s box keeps its children's vertical margins inside it: a
+/// flex or grid container (its items' margins never collapse with it), a
+/// `flow-root` or any other display that starts a new formatting context.
+/// Only plain block flow lets a child's margin collapse through.
+fn holds_child_margins_static(style: &StyleValues) -> bool {
+    let display = js::to_lower_case(js::trim(sv(style, "display")));
+    !matches!(display.as_str(), "" | "block" | "list-item")
+}
 
 fn is_transparent_wrapper_static(el: &StaticElement<'_>, style: &StyleValues) -> bool {
     if has_visible_background_boundary(style, el) {
@@ -537,7 +582,7 @@ fn insulates_side(
     if insulates(PAD_KEYS[s]) || (margins_count && insulates(MARGIN_KEYS[s])) {
         return true;
     }
-    if depth == 0 || el.has_direct_text_longer_than(4) {
+    if depth == 0 || el.has_direct_text_longer_than(4) || is_offset_static(style) {
         return false;
     }
     let children = el.children();
@@ -578,17 +623,16 @@ fn insulates_side(
             // of a parent with no border, padding or clip on that side;
             // horizontal margins never do. A `flow-root` or a flex column
             // holds the margins inside, so they inset the reader's view.
-            let shell_collapses = matches!(display.as_str(), "" | "block");
-            let child_margins = s == 1 || s == 3 || !shell_collapses || outer_stops_collapse;
+            // A border of any colour or padding on the shell's side holds
+            // them too (a transparent wrapper may carry either).
+            let shell_border = side_len(style, ["borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth"][s], font_size)
+                .is_none_or(|v| v > 0.0);
+            let shell_pad = side_len(style, PAD_KEYS[s], font_size).is_none_or(|v| v > 0.0);
+            let shell_stops = !matches!(display.as_str(), "" | "block") || shell_border || shell_pad;
+            let stops_below = outer_stops_collapse || shell_stops;
+            let child_margins = s == 1 || s == 3 || stops_below;
             children.iter().all(|c| {
-                insulates_side(
-                    c,
-                    s,
-                    font_size,
-                    depth - 1,
-                    child_margins,
-                    outer_stops_collapse,
-                )
+                insulates_side(c, s, font_size, depth - 1, child_margins, stops_below)
             })
         }
     }
@@ -729,10 +773,17 @@ pub fn check_quality(q: &QualityInput<'_, '_>) -> Vec<RuleHit> {
                         "hidden" | "scroll" | "auto"
                     )
                 });
+                // Any border holds the margin, whatever its colour: a
+                // transparent one reserving space stops collapse as surely as
+                // a painted rule. So does a box that is a flex or grid
+                // container or starts a formatting context of its own.
+                let holds_margins = holds_child_margins_static(style);
                 let mut children_insulate = [false; 4];
                 for s in 0..4 {
-                    let stops_collapse =
-                        border_visible[s] || pad[s].is_some_and(|v| v > 0.0) || clips;
+                    let stops_collapse = (border_w[s] > 0.0 && bs(["borderTopStyle", "borderRightStyle", "borderBottomStyle", "borderLeftStyle"][s]))
+                        || pad[s].is_some_and(|v| v > 0.0)
+                        || clips
+                        || holds_margins;
                     children_insulate[s] = children.iter().any(|c| {
                         insulates_side(c, s, font_size, MAX_INSULATE_DEPTH, true, stops_collapse)
                     });
@@ -932,7 +983,7 @@ pub fn check_quality(q: &QualityInput<'_, '_>) -> Vec<RuleHit> {
             if !is_exempt_context && !is_visually_hidden(el, style) {
                 let is_interactive = is_in_control(el);
                 let is_furniture = el.closest(FURNITURE_ELEMENTS).is_some()
-                    || el.closest(FURNITURE_CLASSES).is_some_and(|m| m.tag_lower() != "html");
+                    || has_furniture_class(*el);
                 let is_smallprint = el.closest(SMALLPRINT).is_some();
                 let floor = if !is_interactive && is_smallprint {
                     SMALLPRINT_TEXT_FLOOR_PX
