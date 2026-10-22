@@ -636,11 +636,15 @@ fn insulates_side(
             let shell_border = side_len(style, ["borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth"][s], font_size)
                 .is_none_or(|v| v > 0.0);
             let shell_pad = side_len(style, PAD_KEYS[s], font_size).is_none_or(|v| v > 0.0);
-            let shell_stops = !matches!(display.as_str(), "" | "block") || shell_border || shell_pad;
+            // A float holds them as a flow-root does.
+            let shell_stops = holds_child_margins_static(style) || shell_border || shell_pad;
             let stops_below = outer_stops_collapse || shell_stops;
             let child_margins = s == 1 || s == 3 || stops_below;
+            // A child an offset moves (`padding: 24px; left: -24px`) cannot
+            // vouch for the side with its own padding either.
             children.iter().all(|c| {
-                insulates_side(c, s, font_size, depth - 1, child_margins, stops_below)
+                !is_offset_static(c.style())
+                    && insulates_side(c, s, font_size, depth - 1, child_margins, stops_below)
             })
         }
     }
