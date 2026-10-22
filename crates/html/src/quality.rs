@@ -662,10 +662,16 @@ fn insulates_side(
                 && in_flow.iter().all(|c| {
                     let cs = c.style();
                     // A negative margin only cancels clearance when it eats
-                    // the padding down past the threshold.
+                    // the padding down past the threshold. Both lengths are
+                    // the child's, so an em resolves on its own font size;
+                    // one this engine cannot read keeps the warning.
+                    let child_fs = {
+                        let fs = js::to_lower_case(js::trim(sv(cs, "fontSize")));
+                        fs.strip_suffix("px").and_then(|n| n.trim().parse::<f64>().ok())
+                    };
                     let pulled = js::trim(sv(cs, MARGIN_KEYS[s])).starts_with('-')
                         && !matches!(
-                            (side_len(cs, PAD_KEYS[s], font_size), side_len(cs, MARGIN_KEYS[s], font_size)),
+                            (side_len(cs, PAD_KEYS[s], child_fs), side_len(cs, MARGIN_KEYS[s], child_fs)),
                             (Some(pad), Some(margin)) if pad + margin >= 4.0
                         );
                     !is_offset_static(cs)

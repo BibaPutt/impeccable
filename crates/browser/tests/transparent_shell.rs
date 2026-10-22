@@ -45,6 +45,7 @@ fn the_shell_fixture_reports_exactly_its_flag_column() {
     assert_eq!(
         flagged,
         vec![
+            "#flag-shell-em-pull",
             "#flag-shell-loose-sibling",
             "#flag-shell-margins-escape",
             "#flag-shell-negative-margin",

@@ -58,6 +58,7 @@
     .float-shell { float: left; width: 480px; }
     .pull-each p { margin-left: -24px; }
     .nudge-each p { margin-left: -1px; }
+    .em-pull-each p { font-size: 32px; line-height: 40px; margin-left: -0.75em; }
     .pinned { position: relative; height: 160px; }
     .pinned .shell p + p { position: absolute; left: -24px; top: 72px; }
     .card > .loose { margin: 0; padding: 0; }
@@ -114,6 +115,14 @@
         <div class="flag-shell-loose-sibling card ruled padded" id="flag-shell-loose-sibling">
           <div class="shell"><p>Copy padded off the rule.</p><p>A second padded paragraph.</p></div>
           <p class="loose">Copy beside the shell with no inset.</p>
+        </div>
+      </div>
+
+      <h3>Paragraphs pulled by an em margin</h3>
+      <div class="case">
+        <span class="case-label">32px paragraphs with margin-left: -0.75em, which is -24px at their own size and cancels the padding.</span>
+        <div class="flag-shell-em-pull card ruled padded em-pull-each" id="flag-shell-em-pull">
+          <div class="shell"><p>Large copy pulled onto the rule.</p><p>A second large line.</p></div>
         </div>
       </div>
 
