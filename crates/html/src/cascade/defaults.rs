@@ -140,11 +140,6 @@ pub const STATIC_DEFAULT_STYLE: &[(&str, &str)] = &[
     ("overflow", "visible"),
     ("overflowX", "visible"),
     ("overflowY", "visible"),
-    // Past the JS list: cramped-padding's walk through a transparent shell
-    // (#963) stops at a shell a transform moves, and reads a float as a box
-    // that holds its children's margins.
-    ("transform", "none"),
-    ("float", "none"),
 ];
 
 /// JS `STATIC_DEFAULT_STYLE[prop]`; `None` when the key is absent (the JS
