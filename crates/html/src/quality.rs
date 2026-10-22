@@ -579,6 +579,7 @@ fn insulates_side(
     depth: usize,
     margins_count: bool,
     outer_stops_collapse: bool,
+    sole: bool,
 ) -> bool {
     const CHILD_INSULATE_THRESHOLD: f64 = 4.0;
     let style = el.style();
@@ -602,13 +603,17 @@ fn insulates_side(
             depth - 1,
             margins_count,
             outer_stops_collapse,
+            sole,
         ),
         _ => {
             if children.is_empty() || depth == 0 {
                 return false;
             }
-            // #963: transparent shell holding several padded sections.
-            if !is_transparent_wrapper_static(el, style) {
+            // #963: transparent shell holding several padded sections. Only
+            // a shell that is all the coloured box holds is seen through: a
+            // sibling beside it may reach the edge on its own, and the
+            // shell's padded sections say nothing about it.
+            if !sole || !is_transparent_wrapper_static(el, style) {
                 return false;
             }
             // Only stacked block-level content: side-by-side children
@@ -640,12 +645,26 @@ fn insulates_side(
             let shell_stops = holds_child_margins_static(style) || shell_border || shell_pad;
             let stops_below = outer_stops_collapse || shell_stops;
             let child_margins = s == 1 || s == 3 || stops_below;
-            // A child an offset moves (`padding: 24px; left: -24px`) cannot
-            // vouch for the side with its own padding either.
-            children.iter().all(|c| {
-                !is_offset_static(c.style())
-                    && insulates_side(c, s, font_size, depth - 1, child_margins, stops_below)
-            })
+            // An out-of-flow child is placed by its own offsets, not by the
+            // shell (a badge pinned to the card's corner), and the browser
+            // rule leaves its text out of the wrapper's; it is left out here
+            // too, and the in-flow children decide. Of those, one an offset
+            // moves (`padding: 24px; left: -24px`) or a negative margin pulls
+            // onto the side cannot vouch for it with its own padding.
+            let in_flow: Vec<&StaticElement<'_>> = children
+                .iter()
+                .filter(|c| {
+                    let pos = js::to_lower_case(js::trim(sv(c.style(), "position")));
+                    !matches!(pos.as_str(), "absolute" | "fixed")
+                })
+                .collect();
+            !in_flow.is_empty()
+                && in_flow.iter().all(|c| {
+                    let cs = c.style();
+                    !is_offset_static(cs)
+                        && !js::trim(sv(cs, MARGIN_KEYS[s])).starts_with('-')
+                        && insulates_side(c, s, font_size, depth - 1, child_margins, stops_below, true)
+                })
         }
     }
 }
@@ -797,7 +816,15 @@ pub fn check_quality(q: &QualityInput<'_, '_>) -> Vec<RuleHit> {
                         || clips
                         || holds_margins;
                     children_insulate[s] = children.iter().any(|c| {
-                        insulates_side(c, s, font_size, MAX_INSULATE_DEPTH, true, stops_collapse)
+                        insulates_side(
+                            c,
+                            s,
+                            font_size,
+                            MAX_INSULATE_DEPTH,
+                            true,
+                            stops_collapse,
+                            children.len() == 1,
+                        )
                     });
                 }
                 let side_names = ["top", "right", "bottom", "left"];

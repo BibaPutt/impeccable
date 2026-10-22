@@ -18,6 +18,10 @@
          left rule.
        - A border of any colour on the card, a transparent one included,
          stops the paragraphs' vertical margins from collapsing out of it.
+       - A negative margin cancels a paragraph's padding on that side, and a
+         sibling beside the shell can reach the edge on its own, so neither
+         is cleared by the shell. An absolutely pinned paragraph is placed by
+         its own offsets and is left out, as the browser rule does.
        - A card that is a flex or grid container, a flow-root or a float
          holds its children's vertical margins inside, so they inset the
          text.
@@ -52,6 +56,10 @@
     .float-card { float: left; }
     .shift-each p { position: relative; left: -24px; }
     .float-shell { float: left; width: 480px; }
+    .pull-each p { margin-left: -24px; }
+    .pinned { position: relative; height: 160px; }
+    .pinned .shell p + p { position: absolute; left: -24px; top: 72px; }
+    .card > .loose { margin: 0; padding: 0; }
   </style>
 </head>
 <body>
@@ -88,6 +96,23 @@
         <span class="case-label">each padded paragraph is carried 24px left by its own relative offset, onto the card's rule.</span>
         <div class="flag-shell-paragraph-offset card ruled padded shift-each" id="flag-shell-paragraph-offset">
           <div class="shell"><p>Copy its own offset carried onto the rule.</p><p>A second paragraph beside it.</p></div>
+        </div>
+      </div>
+
+      <h3>Paragraphs pulled by a negative margin</h3>
+      <div class="case">
+        <span class="case-label">each padded paragraph has margin-left: -24px, which cancels its padding on the left rule.</span>
+        <div class="flag-shell-negative-margin card ruled padded pull-each" id="flag-shell-negative-margin">
+          <div class="shell"><p>Copy a negative margin pulled onto the rule.</p><p>A second paragraph beside it.</p></div>
+        </div>
+      </div>
+
+      <h3>Unpadded paragraph beside the shell</h3>
+      <div class="case">
+        <span class="case-label">a padded shell sits beside an unpadded paragraph that touches the card's rules.</span>
+        <div class="flag-shell-loose-sibling card ruled padded" id="flag-shell-loose-sibling">
+          <div class="shell"><p>Copy padded off the rule.</p><p>A second padded paragraph.</p></div>
+          <p class="loose">Copy beside the shell with no inset.</p>
         </div>
       </div>
 
@@ -140,6 +165,14 @@
         <span class="case-label">the card is a flow-root: it contains its children's margins.</span>
         <div class="pass-shell-flow-root-card card spaced flow-root-card" id="pass-shell-flow-root-card">
           <div class="shell"><p>Copy in a flow-root card.</p><p>A second paragraph below it.</p></div>
+        </div>
+      </div>
+
+      <h3>Pinned label inside the shell</h3>
+      <div class="case">
+        <span class="case-label">the second paragraph is absolutely pinned; its own offsets place it, not the shell (like a badge on a card corner), so the in-flow paragraph decides.</span>
+        <div class="pass-shell-pinned-label card ruled padded pinned" id="pass-shell-pinned-label">
+          <div class="shell"><p>Copy in normal flow, padded off the rule.</p><p>Pinned label copy.</p></div>
         </div>
       </div>
 
